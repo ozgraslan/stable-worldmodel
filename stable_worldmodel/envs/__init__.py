@@ -22,6 +22,11 @@ def register(id, entry_point, discrete=False, **kwargs):
 # )
 
 register(
+    id='swm/Libero-v0',
+    entry_point='stable_worldmodel.envs.libero:Libero',
+)
+
+register(
     id='swm/PushT-v1',
     entry_point='stable_worldmodel.envs.pusht.env:PushT',
 )
