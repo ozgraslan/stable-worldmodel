@@ -7,7 +7,7 @@ from .normalization import (
     get_scaler,
 )
 from .utils import column_normalizer
-from .buffer import ReplayBuffer
+from .buffer import ReplayBuffer, classic_filter
 from .format import (
     FORMATS,
     WRITE_MODES,
@@ -58,6 +58,7 @@ __all__ = [
     'WRITE_MODES',
     'Writer',
     'ZScoreScaler',
+    'classic_filter',
     'column_normalizer',
     'detect_format',
     'get_format',

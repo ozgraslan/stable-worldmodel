@@ -60,6 +60,9 @@ class ReplayBuffer(Dataset):
             ``[0, buffer.num_valid_ends(history_len))``. Default is uniform.
         transform: Optional dict-in / dict-out transform applied per clip
             in the Dataset path (``__getitem__``).
+        key_filter: Optional ``fn(ep_data) -> ep_data`` applied to each
+            episode in ``write_episode``, returning the subset of columns to
+            store. ``None`` (default) stores every column.
     """
 
     def __init__(
@@ -69,6 +72,7 @@ class ReplayBuffer(Dataset):
         frameskip: int = 1,
         sampler: Sampler | None = None,
         transform: Callable[[dict], dict] | None = None,
+        key_filter: Callable[[dict], dict] | None = None,
     ) -> None:
         if max_steps <= 0:
             raise ValueError(f'max_steps must be positive, got {max_steps}')
@@ -85,6 +89,7 @@ class ReplayBuffer(Dataset):
         self.frameskip = int(frameskip)
         self.span = self.num_steps * self.frameskip
         self.transform = transform
+        self.key_filter = key_filter
         self.sampler: Sampler = (
             sampler if sampler is not None else _uniform_sampler
         )
@@ -107,6 +112,10 @@ class ReplayBuffer(Dataset):
         """Append one completed episode, every column must already span the full episode."""
         if not ep_data:
             return
+        if self.key_filter is not None:
+            ep_data = self.key_filter(ep_data)
+            if not ep_data:
+                return
         per_step, ep_len = self._coerce_episode(ep_data)
         if ep_len == 0:
             return
@@ -196,6 +205,17 @@ class ReplayBuffer(Dataset):
 
     def __len__(self) -> int:
         return self.num_valid_ends(self.history_len)
+
+    def __repr__(self) -> str:
+        cols = ', '.join(self.column_names) or '-'
+        return (
+            f'ReplayBuffer('
+            f'episodes={self.num_episodes}, '
+            f'steps={self.num_steps_stored}/{self.max_steps}, '
+            f'history_len={self.history_len}, '
+            f'frameskip={self.frameskip}, '
+            f'columns=[{cols}])'
+        )
 
     def __getitem__(self, idx: int) -> dict:
         n = len(self)
@@ -403,4 +423,15 @@ class ReplayBuffer(Dataset):
         return clip
 
 
-__all__ = ['ReplayBuffer']
+def classic_filter(ep_data: dict) -> dict:
+    """``key_filter`` keeping only the classic replay-buffer columns and
+    dropping the rest: ``pixels`` (the observation), ``action``, ``reward``,
+    ``terminated`` and ``truncated``.
+
+    Use as ``ReplayBuffer(..., key_filter=classic_filter)``.
+    """
+    classic_keys = ('pixels', 'action', 'reward', 'terminated', 'truncated')
+    return {k: v for k, v in ep_data.items() if k in classic_keys}
+
+
+__all__ = ['ReplayBuffer', 'classic_filter']
