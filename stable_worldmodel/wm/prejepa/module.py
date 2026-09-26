@@ -152,6 +152,92 @@ class CausalPredictor(nn.Module):
         return x
 
 
+def modulate(x, shift, scale):
+    """AdaLN-zero modulation."""
+    return x * (1 + scale) + shift
+
+
+class AdaLNCausalPredictor(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_patches,
+        num_frames,
+        dim,
+        depth,
+        heads,
+        mlp_dim,
+        pool='cls',
+        dim_head=64,
+        dropout=0.0,
+        emb_dropout=0.0,
+        condition_dim=None,
+        condition_from='full',
+        hidden_dim=None,
+        **kwargs,
+    ):
+        super().__init__()
+        assert pool in {'cls', 'mean'}, (
+            'pool type must be either cls (cls token) or mean (mean pooling)'
+        )
+        assert condition_from in {'full', 'tail'}, (
+            'condition_from must be either full or tail'
+        )
+
+        self.num_patches = num_patches
+        self.num_frames = num_frames
+        self.condition_dim = condition_dim or dim
+        self.condition_from = condition_from
+        self.hidden_dim = hidden_dim or dim
+
+        self.input_projection = (
+            nn.Linear(dim, self.hidden_dim)
+            if dim != self.hidden_dim
+            else nn.Identity()
+        )
+        self.output_projection = (
+            nn.Linear(self.hidden_dim, dim)
+            if dim != self.hidden_dim
+            else nn.Identity()
+        )
+
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, num_frames * num_patches, self.hidden_dim)
+        )
+        self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = AdaLNTransformer(
+            self.hidden_dim,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim,
+            dropout,
+            num_patches,
+            num_frames,
+            condition_dim=self.condition_dim,
+        )
+        self.pool = pool
+
+    def _conditioning(self, x):
+        if self.condition_from == 'tail':
+            if self.condition_dim > x.shape[-1]:
+                raise ValueError(
+                    'condition_dim cannot be larger than input dim when '
+                    'condition_from="tail"'
+                )
+            return x[..., -self.condition_dim :]
+        return x
+
+    def forward(self, x, c=None):
+        n = x.shape[1]
+        c = self._conditioning(x) if c is None else c
+        x = self.input_projection(x)
+        x = x + self.pos_embedding[:, :n]
+        x = self.dropout(x)
+        x = self.transformer(x, c)
+        return self.output_projection(x)
+
+
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.0):
         super().__init__()
@@ -272,4 +358,90 @@ class Transformer(nn.Module):
             x = attn(x) + x
             x = ff(x) + x
 
+        return self.norm(x)
+
+
+class AdaLNBlock(nn.Module):
+    """Transformer block with AdaLN-zero conditioning."""
+
+    def __init__(
+        self,
+        dim,
+        heads,
+        dim_head,
+        mlp_dim,
+        dropout=0.0,
+        num_patches=1,
+        num_frames=1,
+    ):
+        super().__init__()
+        self.attn = Attention(
+            dim,
+            heads=heads,
+            dim_head=dim_head,
+            dropout=dropout,
+            num_patches=num_patches,
+            num_frames=num_frames,
+        )
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True)
+        )
+
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+        x = x + gate_msa * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa)
+        )
+        x = x + gate_mlp * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        )
+        return x
+
+
+class AdaLNTransformer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        depth,
+        heads,
+        dim_head,
+        mlp_dim,
+        dropout=0.0,
+        num_patches=1,
+        num_frames=1,
+        condition_dim=None,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.cond_proj = (
+            nn.Linear(condition_dim, dim)
+            if condition_dim is not None and condition_dim != dim
+            else nn.Identity()
+        )
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(
+                AdaLNBlock(
+                    dim,
+                    heads=heads,
+                    dim_head=dim_head,
+                    mlp_dim=mlp_dim,
+                    dropout=dropout,
+                    num_patches=num_patches,
+                    num_frames=num_frames,
+                )
+            )
+
+    def forward(self, x, c):
+        c = self.cond_proj(c)
+        for block in self.layers:
+            x = block(x, c)
         return self.norm(x)

@@ -3,7 +3,7 @@ defaults:
   - launcher: local
   - data: pusht
 
-output_model_name: lewm
+output_model_name: lewm_proprio
 
 num_workers: 6
 train_split: 0.9
@@ -11,7 +11,9 @@ seed: 3072
 img_size: 224
 patch_size: 14
 encoder_scale: tiny
-embed_dim: ${vit_embed_dim:${encoder_scale}}
+encoder_embed_dim: ${vit_embed_dim:${encoder_scale}}
+proprio_embed_dim: 128
+embed_dim: ${eval:'${encoder_embed_dim} + ${proprio_embed_dim}'}
 dump_object: True
 save_step_interval: 5000
 
@@ -42,7 +44,7 @@ wm:
   num_preds: 1
 
 model:
-  _target_: stable_worldmodel.wm.lewm.LeWM
+  _target_: stable_worldmodel.wm.lewm.lewm_proprio.LeWMProprio
   encoder:
     _target_: stable_pretraining.backbone.utils.vit_hf
     size: ${encoder_scale}
@@ -66,6 +68,14 @@ model:
     _target_: stable_worldmodel.wm.lewm.module.Embedder
     input_dim: ???
     emb_dim: ${embed_dim}
+  proprio_encoder:
+    _target_: stable_worldmodel.wm.lewm.module.MLP
+    input_dim: ???
+    output_dim: ${proprio_embed_dim}
+    hidden_dim: 512
+    norm_fn:
+      _target_: torch.nn.LayerNorm
+      _partial_: true
   projector:
     _target_: stable_worldmodel.wm.lewm.module.MLP
     input_dim: ${embed_dim}

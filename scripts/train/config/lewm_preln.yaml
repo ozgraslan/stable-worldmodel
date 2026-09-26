@@ -1,0 +1,12 @@
+defaults:
+  - lewm
+  - _self_
+
+output_model_name: lewm_preln
+
+# Projection-free LeWM using the last ViT block output before the model-level
+# final LayerNorm. CLS and patch tokens therefore share the same raw space.
+model:
+  _target_: stable_worldmodel.wm.lewm_preln.LeWMPreLN
+  projector: null
+  pred_proj: null

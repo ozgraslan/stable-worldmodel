@@ -100,6 +100,8 @@ class CubeEnv(ManipSpaceEnv):
         multiview=False,
         height=224,
         width=224,
+        subgoal_eef_threshold=0.04,
+        subgoal_gripper_threshold=0.05,
         *args,
         **kwargs,
     ):
@@ -135,6 +137,8 @@ class CubeEnv(ManipSpaceEnv):
         self._env_type = env_type
         self._permute_blocks = permute_blocks
         self._multiview = multiview
+        self._subgoal_eef_threshold = subgoal_eef_threshold
+        self._subgoal_gripper_threshold = subgoal_gripper_threshold
         self.env_name = 'Cube'
 
         if self._env_type == 'single':
@@ -789,6 +793,10 @@ class CubeEnv(ManipSpaceEnv):
                   directly (overrides sampled values when provided).
                 - 'state': Optional simulator state override. Accepts either a
                   dict with 'qpos' and 'qvel' entries, or a (qpos, qvel) tuple.
+                - 'evaluation_goal': Intermediate state snapshot returned by
+                  :meth:`capture_evaluation_goal`.
+                - 'evaluation_start': Simulator snapshot used as the rollout
+                  starting state.
             *args: Variable length argument list passed to parent reset.
             **kwargs: Arbitrary keyword arguments passed to parent reset.
 
@@ -834,6 +842,23 @@ class CubeEnv(ManipSpaceEnv):
             qpos = state[: self._model.nq]
             qvel = state[self._model.nq :]
             self.set_state(qpos, qvel)
+            self.pre_step()
+            self.post_step()
+            ob = self.compute_observation()
+            info = self.get_reset_info()
+
+        if options.get('evaluation_start') is not None:
+            self.set_evaluation_start(options['evaluation_start'])
+            self.pre_step()
+            self.post_step()
+            ob = self.compute_observation()
+            info = self.get_reset_info()
+
+        if options.get('evaluation_goal') is not None:
+            self.set_evaluation_goal(
+                options['evaluation_goal'],
+                render_goal=options.get('render_goal', self._render_goal),
+            )
             self.pre_step()
             self.post_step()
             ob = self.compute_observation()
@@ -1410,6 +1435,8 @@ class CubeEnv(ManipSpaceEnv):
         reset_info = self.compute_ob_info()
         reset_info['env_name'] = self.env_name
         reset_info['target'] = self._cur_goal_ob
+        if getattr(self, '_cur_goal_rendered', None) is not None:
+            reset_info['goal'] = self._cur_goal_rendered.copy()
         reset_info['success'] = self._success
         return reset_info
 
@@ -1431,14 +1458,16 @@ class CubeEnv(ManipSpaceEnv):
         ob_info = self.compute_ob_info()
         ob_info['env_name'] = self.env_name
         ob_info['target'] = self._cur_goal_ob
+        if getattr(self, '_cur_goal_rendered', None) is not None:
+            ob_info['goal'] = self._cur_goal_rendered.copy()
         ob_info['success'] = self._success
         return ob_info
 
     def add_object_info(self, ob_info):
         """Add cube-specific information to the observation info dictionary.
 
-        Augments the info dictionary with privileged state information about all cubes
-        including positions, orientations, and target information (in data collection mode).
+        Augments the info dictionary with privileged state information about
+        all cubes, including positions, orientations, and oracle targets.
 
         Args:
             ob_info (dict): Observation info dictionary to augment. Modified in-place.
@@ -1447,14 +1476,15 @@ class CubeEnv(ManipSpaceEnv):
             - 'privileged/block_{i}_pos': 3D position (x, y, z) of cube i
             - 'privileged/block_{i}_quat': Quaternion (w, x, y, z) of cube i
             - 'privileged/block_{i}_yaw': Yaw angle in radians of cube i
-            - 'privileged/target_task': Task type string (data collection mode only)
-            - 'privileged/target_block': Index of target cube (data collection mode only)
-            - 'privileged/target_block_pos': Target position (data collection mode only)
-            - 'privileged/target_block_yaw': Target yaw angle (data collection mode only)
+            - 'privileged/target_task': Task type string
+            - 'privileged/target_block': Index of the oracle target cube
+            - 'privileged/target_block_pos': Target position
+            - 'privileged/target_block_yaw': Target yaw angle
 
         Note:
-            All positions are in world coordinates. Quaternions use (w, x, y, z) format.
-            Privileged information is typically not available to policies during deployment.
+            All positions are in world coordinates. Quaternions use
+            (w, x, y, z) format. Privileged information is typically not
+            available to policies during deployment.
         """
         # Cube positions and orientations.
         for i in range(self._num_cubes):
@@ -1473,20 +1503,114 @@ class CubeEnv(ManipSpaceEnv):
             )
 
         if self._mode == 'data_collection':
-            # Target cube info.
-            ob_info['privileged/target_task'] = self._target_task
-            target_mocap_id = self._cube_target_mocap_ids[self._target_block]
-            ob_info['privileged/target_block'] = self._target_block
-            ob_info['privileged/target_block_pos'] = self._data.mocap_pos[
+            ob_info.update(self.evaluation_expert_info())
+
+    def evaluation_expert_info(self) -> dict:
+        """Return the cube target metadata required by the expert policy."""
+        target_mocap_id = self._cube_target_mocap_ids[self._target_block]
+        return {
+            'privileged/target_task': self._target_task,
+            'privileged/target_block': self._target_block,
+            'privileged/target_block_pos': self._data.mocap_pos[
                 target_mocap_id
-            ].copy()
-            ob_info['privileged/target_block_yaw'] = np.array(
+            ].copy(),
+            'privileged/target_block_yaw': np.array(
                 [
                     lie.SO3(
                         wxyz=self._data.mocap_quat[target_mocap_id]
                     ).compute_yaw_radians()
                 ]
+            ),
+        }
+
+    def capture_evaluation_goal(self) -> dict:
+        """Capture a JSON-serializable intermediate simulator goal state."""
+        ob_info = self.compute_ob_info()
+        return {
+            'qpos': self._data.qpos.tolist(),
+            'qvel': self._data.qvel.tolist(),
+            'mocap_pos': self._data.mocap_pos.tolist(),
+            'mocap_quat': self._data.mocap_quat.tolist(),
+            'ctrl': self._data.ctrl.tolist(),
+            'act': self._data.act.tolist(),
+            'time': float(self._data.time),
+            'effector_position': ob_info['proprio/effector_pos'].tolist(),
+            'gripper_opening': ob_info[
+                'proprio/gripper_opening'
+            ].tolist(),
+            'block_positions': [
+                self._data.joint(f'object_joint_{i}').qpos[:3].tolist()
+                for i in range(self._num_cubes)
+            ],
+            'block_quaternions': [
+                self._data.joint(f'object_joint_{i}').qpos[3:].tolist()
+                for i in range(self._num_cubes)
+            ],
+        }
+
+    def set_evaluation_start(self, state: dict) -> None:
+        """Restore the simulator/controller state for an offset rollout."""
+        self._data.qpos[:] = np.asarray(state['qpos'])
+        self._data.qvel[:] = np.asarray(state['qvel'])
+        self._data.mocap_pos[:] = np.asarray(state['mocap_pos'])
+        self._data.mocap_quat[:] = np.asarray(state['mocap_quat'])
+        self._data.ctrl[:] = np.asarray(state['ctrl'])
+        if self._data.act.size:
+            self._data.act[:] = np.asarray(state['act'])
+        self._data.time = state['time']
+        mujoco.mj_forward(self._model, self._data)
+
+    def evaluation_goal_distance(self, goal=None) -> float:
+        """Return the largest cube displacement to a requested goal."""
+        distances = []
+        for i, mocap_id in enumerate(self._cube_target_mocap_ids):
+            block_pos = self._data.joint(f'object_joint_{i}').qpos[:3]
+            target_pos = (
+                self._data.mocap_pos[mocap_id]
+                if goal is None
+                else np.asarray(goal['block_positions'][i])
             )
+            distances.append(np.linalg.norm(block_pos - target_pos))
+        return float(max(distances))
+
+    def evaluation_subgoal_reached(self, goal: dict) -> bool:
+        """Check block, end-effector, and gripper subgoal completion."""
+        ob_info = self.compute_ob_info()
+        block_reached = self.evaluation_goal_distance(goal) <= 0.04
+        eef_distance = np.linalg.norm(
+            ob_info['proprio/effector_pos']
+            - np.asarray(goal['effector_position'])
+        )
+        gripper_distance = np.max(
+            np.abs(
+                ob_info['proprio/gripper_opening']
+                - np.asarray(goal['gripper_opening'])
+            )
+        )
+        return bool(
+            block_reached
+            and eef_distance <= self._subgoal_eef_threshold
+            and gripper_distance <= self._subgoal_gripper_threshold
+        )
+
+    def set_evaluation_goal(self, goal: dict, render_goal: bool = True) -> None:
+        """Use a captured intermediate state as the task goal."""
+        initial_qpos = self._data.qpos.copy()
+        initial_qvel = self._data.qvel.copy()
+
+        for i, mocap_id in enumerate(self._cube_target_mocap_ids):
+            self._data.mocap_pos[mocap_id] = goal['block_positions'][i]
+            self._data.mocap_quat[mocap_id] = goal['block_quaternions'][i]
+
+        self._data.qpos[:] = np.asarray(goal['qpos'])
+        self._data.qvel[:] = np.asarray(goal['qvel'])
+        mujoco.mj_forward(self._model, self._data)
+        self._cur_goal_ob = self.compute_observation()
+        self._cur_goal_rendered = self.render() if render_goal else None
+
+        self._data.qpos[:] = initial_qpos
+        self._data.qvel[:] = initial_qvel
+        mujoco.mj_forward(self._model, self._data)
 
     def compute_observation(self):
         """Compute the current observation based on observation type.

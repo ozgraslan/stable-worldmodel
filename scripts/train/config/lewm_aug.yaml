@@ -13,11 +13,17 @@ patch_size: 14
 encoder_scale: tiny
 embed_dim: ${vit_embed_dim:${encoder_scale}}
 dump_object: True
-save_step_interval: 5000
+
+augmentation:
+  enabled: true
+  random_resized_crop:
+    enabled: true
+    scale: [0.8, 1.0]
+    ratio: [1.0, 1.0]
 
 trainer:
   default_root_dir: ${oc.env:STABLEWM_HOME}/checkpoints/${subdir}/pl_trainer
-  max_steps: 100000
+  max_epochs: 100
   devices: auto
   accelerator: gpu
   precision: bf16

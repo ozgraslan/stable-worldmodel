@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 
 from stable_worldmodel.wm.utils import (
     _load_config,
+    _migrate_legacy_vit_state_dict,
     _resolve,
     _resolve_folder,
     load_pretrained,
@@ -273,6 +274,46 @@ def test_load_pretrained_missing_config_raises(tmp_path):
     with patch('hydra.utils.instantiate', return_value=TinyModel()):
         with pytest.raises(FileNotFoundError, match='config.json not found'):
             load_pretrained('run_no_cfg', cache_dir=tmp_path)
+
+
+def test_migrate_legacy_vit_state_dict():
+    query = torch.randn(4, 4)
+    norm = torch.randn(4)
+    untouched = torch.randn(2)
+    state_dict = {
+        'encoder.encoder.layer.3.attention.attention.query.weight': query,
+        'encoder.encoder.layer.3.layernorm_before.weight': norm,
+        'predictor.bias': untouched,
+    }
+    model_state_dict = {
+        'encoder.layers.3.attention.q_proj.weight': torch.empty_like(query),
+        'encoder.layers.3.layernorm_before.weight': torch.empty_like(norm),
+        'predictor.bias': torch.empty_like(untouched),
+    }
+
+    migrated = _migrate_legacy_vit_state_dict(state_dict, model_state_dict)
+
+    assert set(migrated) == set(model_state_dict)
+    assert migrated['encoder.layers.3.attention.q_proj.weight'] is query
+    assert migrated['encoder.layers.3.layernorm_before.weight'] is norm
+    assert migrated['predictor.bias'] is untouched
+    assert set(state_dict) != set(migrated)
+
+
+def test_migrate_legacy_vit_keeps_unknown_or_incompatible_keys():
+    unknown = torch.randn(4)
+    wrong_shape = torch.randn(3, 3)
+    state_dict = {
+        'encoder.encoder.layer.0.unknown.weight': unknown,
+        'encoder.encoder.layer.0.output.dense.weight': wrong_shape,
+    }
+    model_state_dict = {
+        'encoder.layers.0.mlp.fc2.weight': torch.randn(4, 4),
+    }
+
+    migrated = _migrate_legacy_vit_state_dict(state_dict, model_state_dict)
+
+    assert migrated == state_dict
 
 
 def test_load_pretrained_uses_hf_cache_without_downloading(tmp_path):

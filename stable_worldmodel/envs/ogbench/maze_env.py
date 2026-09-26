@@ -481,6 +481,17 @@ class MazeEnv(gym.Wrapper):
         """Mark the model as requiring recompilation on the next reset."""
         self._dirty = True
 
+    def close(self):
+        """Release OGBench's custom renderer before EGL shuts down."""
+        renderer = getattr(self.env, 'custom_renderer', None)
+        if renderer is not None:
+            renderer.close()
+            self.env.custom_renderer = None
+        super().close()
+        if self._mjcf_tempdir is not None:
+            self._mjcf_tempdir.cleanup()
+            self._mjcf_tempdir = None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

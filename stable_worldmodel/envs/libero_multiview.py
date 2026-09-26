@@ -92,12 +92,16 @@ class Libero(gym.Env):
         cfg={},
         env_name="spatial",
         task_id=0,
-        camera_name="agentview",
+        camera_names=["agentview"],
         render_mode="rgb_array",
+        multiview=False,
         *args,
         **kwargs,
     ):
         super().__init__()
+        self.camera_names = camera_names.copy()
+        if multiview:
+            self.camera_names.append("robot0_eye_in_hand")
         if env is None:
             logger.info(f'Creating Libero task_name and task_id: {env_name}, {task_id}')
             benchmark_instance = BENCHMARKDICT[f"libero_{env_name}"]
@@ -107,7 +111,7 @@ class Libero(gym.Env):
                 "camera_heights": 224,
                 "camera_widths": 224,
                 "hard_reset": False,
-                "camera_names": [camera_name],
+                "camera_names": self.camera_names
             }
             env = OffScreenRenderEnv(**env_args)
 
@@ -118,8 +122,7 @@ class Libero(gym.Env):
         self.eef_name = "robot0_eef"
 
         self.task_name = env_name
-        self.camera_name = camera_name
-        self.custom_camera_name = self.camera_name
+        self._multiview = multiview
         self.camera_width = self.env.env.camera_widths[0]
         self.camera_height = self.env.env.camera_heights[0]
         self.full_action_dim = self.env.env.action_dim
@@ -194,7 +197,12 @@ class Libero(gym.Env):
             goal_distance = options.get('goal_distance', 'max')
             init_sim_state, goal_sim_state = self.sample_init_goal_sim_state(goal_distance)
             goal_obs = self._restore_sim_state(goal_sim_state)
-            self._goal = goal_obs[f"{self.camera_name}_image"][::-1, ::-1].copy()
+            if self._multiview:
+                self._goal = {}
+                for camera_name in self.camera_names:
+                    self._goal[camera_name] = goal_obs[f"{camera_name}_image"][::-1, ::-1].copy()
+            else:
+                self._goal = goal_obs[f"{self.camera_names[0]}_image"][::-1, ::-1].copy()
             self._goal_proprio = get_proprio(goal_obs)
             self._goal_obj_pos_dict = {obj: goal_obs[f"{obj}_pos"].copy() for obj in self.obj_of_interest}
             self._goal_sampling_success = True
@@ -202,7 +210,7 @@ class Libero(gym.Env):
             self._goal_sim_state = goal_sim_state
             info = self._restore_sim_state(init_sim_state) 
         else:
-            self._goal = self.render()
+            self._goal = self.render_multiview()
             self._goal_proprio = None
             self._goal_obj_pos_dict = {imp_obj: None for imp_obj in self.obj_of_interest}
             self._goal_sampling_success = False
@@ -212,7 +220,12 @@ class Libero(gym.Env):
 
         obs, info = self.get_obs_proprio_succ_from_info(info)
 
-        info['goal'] = self._goal
+        if type(self._goal) is dict:
+            info['goal'] = self._goal[self.camera_names[0]]
+            info['goal_pixels_wrist'] = self._goal[self.camera_names[1]]
+        else:
+            info['goal'] = self._goal
+
         info['goal_proprio'] = self._goal_proprio
         for obj in self.obj_of_interest:
             info[f"goal_{obj}_pos"] = self._goal_obj_pos_dict[obj]
@@ -230,7 +243,12 @@ class Libero(gym.Env):
 
         obs, info = self.get_obs_proprio_succ_from_info(info)
 
-        info['goal'] = self._goal
+        if type(self._goal) is dict:
+            info['goal'] = self._goal[self.camera_names[0]]
+            info['goal_pixels_wrist'] = self._goal[self.camera_names[1]]
+        else:
+            info['goal'] = self._goal
+
         info['goal_proprio'] = self._goal_proprio
         info['goal_sampling_success'] = getattr(
             self, '_goal_sampling_success', False
@@ -245,14 +263,23 @@ class Libero(gym.Env):
             logger.info('Task success detected in step()')
         return obs, reward, success, False, info
     
-    def render(self):
+    def render(self, camera_name="agentview"):
         result = self.env.sim.render(
             height=self.camera_height,
             width=self.camera_width,
-            camera_name=self.camera_name,
+            camera_name=camera_name,
         )[::-1, ::-1].copy()
         return result
-    
+
+    def render_multiview(self, camera_name="agentview"):
+        if not self._multiview:
+            return self.render(camera_name=camera_name)
+
+        multi_view = {
+            cam_name: self.render(camera_name=cam_name) for cam_name in self.camera_names
+        }
+        return multi_view
+
     def seed(self, seed=None):
         if seed is None:
             seed = np.random.randint(0, 25536)
@@ -310,7 +337,13 @@ class Libero(gym.Env):
     def _set_goal_state(self, goal_sim_state):
         sim_state = self._save_sim_state()
         goal_obs = self._restore_sim_state(goal_sim_state)
-        self._goal = goal_obs[f"{self.camera_name}_image"][::-1, ::-1].copy()
+        if self._multiview:
+            self._goal = {}
+            for camera_name in self.camera_names:
+                self._goal[camera_name] = goal_obs[f"{camera_name}_image"][::-1, ::-1].copy()
+        else:
+            self._goal = goal_obs[f"{self.camera_names[0]}_image"][::-1, ::-1].copy()
+
         self._goal_proprio = get_proprio(goal_obs)
         self._goal_obj_pos_dict = {obj: goal_obs[f"{obj}_pos"].copy() for obj in self.obj_of_interest}
         self._goal_sampling_success = True
@@ -318,9 +351,14 @@ class Libero(gym.Env):
         self._restore_sim_state(sim_state)
 
 
-    def _set_goal(self, goal, goal_proprio, goal_sim_state, **goal_obj_pos):
-        # print("goal prop:", goal_proprio)
-        self._goal = goal.copy()
+    def _set_goal(self, goal, goal_pixels_wrist, goal_proprio, goal_sim_state, **goal_obj_pos):
+        if self._multiview:
+            self._goal = {
+                self.camera_names[0]: goal.copy(),
+                self.camera_names[1]: goal_pixels_wrist.copy(),
+            }
+        else:
+             self._goal = goal.copy()
         self._goal_proprio = goal_proprio.copy()
         self._goal_obj_pos_dict = {obj.split('_pos')[0]: goal_obj_pos[obj].copy() for obj in goal_obj_pos.keys()}
         self._goal_sim_state = goal_sim_state.copy()

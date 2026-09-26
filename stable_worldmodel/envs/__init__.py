@@ -37,6 +37,12 @@ register(
 )
 
 register(
+    id='swm/DINOPointMaze-v0',
+    entry_point='stable_worldmodel.envs.dino_pointmaze.env:DINOPointMazeEnv',
+    max_episode_steps=300,
+)
+
+register(
     id='swm/TwoRoom-v1',
     entry_point='stable_worldmodel.envs.two_room.env:TwoRoomEnv',
 )

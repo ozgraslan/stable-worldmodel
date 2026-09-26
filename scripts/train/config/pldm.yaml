@@ -5,7 +5,6 @@ defaults:
   - data: pusht
 
 output_model_name: pldm
-subdir: ${hydra:job.id}
 
 num_workers: 6
 train_split: 0.9

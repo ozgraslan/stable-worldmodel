@@ -17,7 +17,9 @@ def save_video(path: Path, frames: list[np.ndarray], fps: int = 15) -> None:
     out.close()
 
 
-def save_panel_videos(video_dir, panels, fps: int = 15) -> None:
+def save_panel_videos(
+    video_dir, panels, fps: int = 15, successes=None
+) -> None:
     """Save one mp4 per env with labeled panels side-by-side.
 
     ``panels`` maps a label to per-env data indexable by env index. Each
@@ -61,4 +63,7 @@ def save_panel_videos(video_dir, panels, fps: int = 15) -> None:
                 x = pad + j * (w + gap) + w // 2 - (b[2] - b[0]) // 2
                 draw.text((x, y_text), label, fill=(130, 130, 130), font=font)
             composed.append(np.array(img))
-        save_video(video_dir / f'env_{i}.mp4', composed, fps=fps)
+        filename = f'env_{i}.mp4'
+        if successes is not None:
+            filename = f'env_{i}_success_{bool(successes[i])}.mp4'
+        save_video(video_dir / filename, composed, fps=fps)

@@ -4,4 +4,10 @@
 defaults:
   - override /hydra/launcher: basic
 
+subdir: ${now:%Y-%m-%d_%H-%M-%S}
+
+hydra:
+  run:
+    dir: ${eval_dir:${policy},${subdir}}/hydra
+
 cache_dir: null # use stable-worldmodel default cache
