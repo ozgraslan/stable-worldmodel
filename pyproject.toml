@@ -17,17 +17,14 @@ dependencies = [
   "torch",
   "torchvision",
   "numpy",
-  "loguru",
   "tabulate",
   "gymnasium",
   "einops",
-  "lancedb>=0.30.0",
-  "pylance>=4.0.0",
-  "pyarrow",
   "pillow",
   "tqdm",
   "typer",
   "rich",
+  "hydra-core",
 ]
 
 [project.scripts]
@@ -36,10 +33,19 @@ swm = "stable_worldmodel.cli:app"
 [project.optional-dependencies]
 train = [
     "transformers>=4.50.0",
-    "stable-pretraining>=0.1.7",
-    "hydra-core",
+    "stable-pretraining>=0.1.8",
+    "datasets>=2.20.0",
     "hydra-submitit-launcher",
     "wandb",
+]
+
+# Lance dataset storage — the default dataset format. Split out of the base
+# install so planning-only consumers (solvers + world model, no dataset IO)
+# are not forced to pull ~410 MB of native wheels.
+data = [
+    "lancedb>=0.30.0",
+    "pylance>=4.0.0",
+    "pyarrow",
 ]
 
 env = [
@@ -50,6 +56,8 @@ env = [
     "minigrid",
     "gymnasium[all]",
     "gymnasium-robotics",
+    # gymnasium-robotics 1.4.2 fails its joint-type checks with MuJoCo 3.12.
+    "mujoco<3.12",
     "opencv-python-headless",
     "stable_baselines3>=2.0.0",
     "craftax>=1.5.0",
@@ -59,8 +67,10 @@ env = [
 format = [
     "h5py",
     "hdf5plugin",
-    "decord",
+    "torchcodec",
     "imageio[ffmpeg]",
+    # Blob-v2 video (lance_video) is layered on the core Lance stack.
+    "stable-worldmodel[data]",
 ]
 
 lerobot = [
@@ -68,7 +78,7 @@ lerobot = [
 ]
 
 all = [
-    "stable-worldmodel[train,env,format]",
+    "stable-worldmodel[train,env,format,data]",
 ]
 
 [dependency-groups]
@@ -82,7 +92,7 @@ dev = [
   "mkdocs-shadcn",
   "pymdown-extensions",
   "pillow",
-  "decord",
+  "torchcodec",
   "imageio[ffmpeg]",
   "mkdocstrings[python]",
 ]

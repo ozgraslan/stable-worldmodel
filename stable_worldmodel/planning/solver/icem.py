@@ -1,5 +1,6 @@
 """Improved Cross Entropy Method (iCEM) solver for model-based planning."""
 
+import logging
 import time
 from typing import Any
 
@@ -7,11 +8,12 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.spaces import Box
-from loguru import logger as logging
 
-from stable_worldmodel.solver.utils import prepare_init_action
+from .utils import prepare_init_action
 from .callbacks import Callback
 from .solver import Costable
+
+logger = logging.getLogger(__name__)
 
 
 class ICEMSolver:
@@ -20,7 +22,7 @@ class ICEMSolver:
     [1] for real-time planning.
 
     Args:
-        model: World model implementing the Costable protocol.
+        cost: Cost object to plan against (a Costable, e.g. a ShootingCostEvaluator).
         batch_size: Number of environments to process in parallel.
         num_samples: Number of action candidates to sample per iteration.
         var_scale: Initial variance scale for the action distribution.
@@ -40,7 +42,7 @@ class ICEMSolver:
 
     def __init__(
         self,
-        model: Costable,
+        cost: Costable,
         batch_size: int = 1,
         num_samples: int = 300,
         var_scale: float = 1,
@@ -54,7 +56,7 @@ class ICEMSolver:
         seed: int = 1234,
         callbacks: list[Callback] | None = None,
     ) -> None:
-        self.model = model
+        self.cost = cost
         self.batch_size = batch_size
         self.var_scale = var_scale
         self.num_samples = num_samples
@@ -68,7 +70,7 @@ class ICEMSolver:
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
         self.callbacks = list(callbacks) if callbacks else []
         try:
-            self._dtype = next(model.parameters()).dtype
+            self._dtype = next(cost.parameters()).dtype
         except (AttributeError, StopIteration):
             self._dtype = torch.float32
 
@@ -92,7 +94,7 @@ class ICEMSolver:
                 action_space.high[0], device=self.device, dtype=self.dtype
             ).repeat(self._config.action_block)
         else:
-            logging.warning(
+            logger.warning(
                 f'Action space is discrete, got {type(action_space)}. ICEMSolver may not work as expected.'
             )
             self._action_low = None
@@ -138,7 +140,9 @@ class ICEMSolver:
         if remaining > 0:
             device = mean.device
             new_mean = torch.zeros(
-                [n_envs, remaining, self.action_dim], dtype=self.dtype
+                [n_envs, remaining, self.action_dim],
+                dtype=self.dtype,
+                device=device,
             )
             mean = torch.cat([mean, new_mean], dim=1).to(device)
 
@@ -161,12 +165,13 @@ class ICEMSolver:
 
         # -- warm-start from actor if model is Actionable, else zero-pad
         init_action = prepare_init_action(
-            self.model,
+            self.cost,
             info_dict,
             init_action,
             self.horizon,
             n_envs=total_envs,
             action_dim=self.action_dim,
+            device=self.device,
         )
 
         mean, var = self.init_action_distrib(total_envs, init_action)
@@ -217,12 +222,13 @@ class ICEMSolver:
                 self.action_dim,
                 self.horizon,
             )
-            freqs = torch.fft.rfftfreq(self.horizon, device=self.device).to(
-                self.dtype
-            )
-            freqs[0] = 1.0
-            noise_scale = freqs.pow(-self.noise_beta / 2)
-            noise_scale[0] = noise_scale[1]
+            if self.horizon > 1:
+                freqs = torch.fft.rfftfreq(
+                    self.horizon, device=self.device
+                ).to(self.dtype)
+                freqs[0] = 1.0
+                noise_scale = freqs.pow(-self.noise_beta / 2)
+                noise_scale[0] = noise_scale[1]
 
             for cb in self.callbacks:
                 cb.start_batch()
@@ -273,7 +279,7 @@ class ICEMSolver:
                         self._action_low, self._action_high
                     )
 
-                costs = self.model.get_cost(expanded_infos, candidates)
+                costs = self.cost.get_cost(expanded_infos, candidates)
 
                 assert isinstance(costs, torch.Tensor), (
                     f'Expected cost to be a torch.Tensor, got {type(costs)}'
@@ -295,7 +301,10 @@ class ICEMSolver:
 
                 # Momentum update
                 elite_mean = topk_candidates.mean(dim=1)
-                elite_var = topk_candidates.std(dim=1)
+                # The elites are the population used to parameterize the next
+                # sampling distribution. Population std is also defined when
+                # a caller intentionally keeps a single elite (topk=1).
+                elite_var = topk_candidates.std(dim=1, correction=0)
                 prev_mean = batch_mean
                 prev_var = batch_var
                 batch_mean = (
@@ -321,12 +330,14 @@ class ICEMSolver:
                         action_high=self._action_high,
                     )
 
-            final_batch_cost = topk_vals.mean(dim=1).cpu().tolist()
-
             if self.return_mean:
                 mean[start_idx:end_idx] = batch_mean
+                # Average elite cost as a summary of the returned mean
+                final_batch_cost = topk_vals.mean(dim=1).cpu().tolist()
             else:
                 mean[start_idx:end_idx] = topk_candidates[:, 0]
+                # Exact cost of the returned best elite
+                final_batch_cost = topk_vals[:, 0].cpu().tolist()
 
             var[start_idx:end_idx] = batch_var
 

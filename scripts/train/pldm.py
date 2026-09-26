@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -8,7 +9,6 @@ from stable_pretraining import data as dt
 import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
-from loguru import logger as logging
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
@@ -18,6 +18,8 @@ from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import PLDMLoss, TemporalStraighteningLoss
 from lightning.pytorch.callbacks import Callback
 from stable_worldmodel.wm.utils import save_pretrained
+
+logger = logging.getLogger(__name__)
 
 
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
@@ -200,26 +202,26 @@ def run(cfg):
     run_dir = Path(
         swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id
     )
-    logging.info(f'🫆🫆🫆 Run ID: {run_id} 🫆🫆🫆')
+    logger.info(f'🫆🫆🫆 Run ID: {run_id} 🫆🫆🫆')
 
-    logger = None
+    wandb_logger = None
     if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg))
+        wandb_logger = WandbLogger(**cfg.wandb.config)
+        wandb_logger.log_hyperparams(OmegaConf.to_container(cfg))
 
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / 'config.yaml', 'w') as f:
         OmegaConf.save(cfg, f)
 
-    object_dump_callback = SaveCkptCallback(
-        run_name=cfg.output_model_name, cfg=cfg, epoch_interval=5
+    save_ckpt_callback = SaveCkptCallback(
+        run_name=cfg.output_model_name, cfg=cfg.model, epoch_interval=5
     )
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=[save_ckpt_callback],
         num_sanity_val_steps=1,
-        logger=logger,
+        logger=wandb_logger,
         enable_checkpointing=True,
     )
 
@@ -236,4 +238,8 @@ def run(cfg):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s | %(name)s | %(message)s',
+    )
     run()
