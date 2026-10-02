@@ -124,6 +124,35 @@ The repository ships reference training scripts under `scripts/train/`. For
 example, `scripts/train/lewm.py` trains the LeWM baseline from image clips and
 actions.
 
+To predict ViT patch tokens instead of the CLS token, select `lewm_patch`:
+
+```bash
+python scripts/train/lewm.py --config-name lewm_patch \
+  data.dataset.name=tutorial_pusht.lance \
+  trainer.max_epochs=2 trainer.max_steps=-1
+```
+
+`LeWMPatch` keeps embeddings shaped `(B, T, P, D)` and predicts all `P`
+patches of the next frame. It uses the same encoder, projection heads,
+action conditioning, prediction MSE, and SIGReg weight as LEWM. The predictor
+attends to all patches within the current and past frames, with learned
+spatial and temporal positions; future frames are masked. The same projector
+also processes the CLS token, retained as `cls_emb` with shape `(B, T, D)`.
+SIGReg operates on these CLS embeddings across the batch at each timestep,
+as in LEWM. The encoder and both sides of the patch prediction loss remain
+trainable.
+
+For the existing ManiSkill overhead vision settings, select
+`--config-name vision_lewm_patch`. Both configs derive the patch count from
+`img_size` and `patch_size` and reuse the existing dataset, training, and
+checkpoint pipeline. Patch attention costs more memory than CLS attention;
+adjust `loader.batch_size` for the image grid and available GPU memory.
+
+The standard `scripts/plan/eval_wm.py` can load these checkpoints. Rollouts
+retain the patch axis, and `GoalMSE` compares all patches of the final
+prediction and goal frame. Use `GoalMSE(reduction='mean')` when comparing
+cost scales across different patch counts.
+
 For a short GPU smoke run:
 
 ```bash

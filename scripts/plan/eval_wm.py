@@ -14,6 +14,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
+
 import stable_worldmodel as swm
 
 
@@ -63,85 +64,18 @@ def get_dataset(cfg, dataset_name):
     return dataset
 
 
-@hydra.main(version_base=None, config_path='./config', config_name='pusht')
-def run(cfg: DictConfig):
-    """Run evaluation of dinowm vs random policy."""
-    assert (
-        cfg.plan_config.horizon * cfg.plan_config.action_block
-        <= cfg.eval.eval_budget
-    ), 'Planning horizon must be smaller than or equal to eval_budget'
-
-    # create world environment
-    cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
-
-    # create the transform
-    img_dtype = torch.bfloat16 if cfg.get('bf16', False) else torch.float32
-    transform = {
-        'pixels': img_transform(cfg, img_dtype),
-        'goal': img_transform(cfg, img_dtype),
-    }
-
-    dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
-    col_name = episode_col(dataset)
-    ep_indices, _ = np.unique(
-        stats_dataset.get_col_data(col_name), return_index=True
-    )
-
-    process = {}
-    for col in cfg.dataset.keys_to_cache:
-        if col in ['pixels']:
-            continue
-        processor = preprocessing.StandardScaler()
-        col_data = stats_dataset.get_col_data(col)
-        col_data = col_data[~np.isnan(col_data).any(axis=1)]
-        processor.fit(col_data)
-        process[col] = processor
-
-        if col != 'action':
-            process[f'goal_{col}'] = process[col]
-
-    # -- run evaluation
-    policy = cfg.get('policy', 'random')
-
-    if policy != 'random':
-        model = swm.wm.utils.load_pretrained(cfg.policy)
-        if cfg.get('bf16', False):
-            model = model.to(torch.bfloat16)
-        model = model.to('cuda')
-        model = model.eval()
-        model.requires_grad_(False)
-        model.interpolate_pos_encoding = True
-        if cfg.get('compile', False):
-            encoder_attr = (
-                'backbone' if hasattr(model, 'backbone') else 'encoder'
-            )
-            setattr(
-                model,
-                encoder_attr,
-                torch.compile(getattr(model, encoder_attr)),
-            )
-            model.predictor = torch.compile(model.predictor)
-        config = swm.PlanConfig(**cfg.plan_config)
-        objective = hydra.utils.instantiate(cfg.objective)
-        cost = swm.planning.ShootingCostEvaluator(model, objective)
-        solver = hydra.utils.instantiate(cfg.solver, cost=cost)
-        policy = swm.policy.WorldModelPolicy(
-            solver=solver, config=config, process=process, transform=transform
-        )
-
-    else:
-        policy = swm.policy.RandomPolicy()
-
-    results_path = (
-        Path(
-            swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy
-        ).parent
-        if cfg.policy != 'random'
-        else Path(__file__).parent
-    )
-
+def evaluation_kwargs(cfg, dataset):
+    """Select native World.evaluate inputs for reset or dataset evaluation."""
+    source = cfg.eval.get('source', 'dataset')
+    if source == 'env':
+        return {
+            'episodes': cfg.eval.num_eval,
+            'seed': cfg.seed,
+            'options': OmegaConf.to_container(cfg.eval.get('env_options', {})),
+        }
+    if source != 'dataset':
+        raise ValueError(f'Unknown evaluation source: {source!r}')
+    ep_indices = np.unique(dataset.get_col_data(episode_col(dataset)))
     # sample the episodes and the starting indices
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
@@ -180,6 +114,100 @@ def run(cfg: DictConfig):
             'Not enough episodes with sufficient length for evaluation.'
         )
 
+    return {
+        'dataset': dataset,
+        'start_steps': eval_start_idx.tolist(),
+        'goal_offset': cfg.eval.goal_offset_steps,
+        'eval_budget': cfg.eval.eval_budget,
+        'episodes_idx': eval_episodes.tolist(),
+        'callables': OmegaConf.to_container(
+            cfg.eval.get('callables'), resolve=True
+        ),
+    }
+
+
+@hydra.main(version_base=None, config_path='./config', config_name='pusht')
+def run(cfg: DictConfig):
+    """Run evaluation of dinowm vs random policy."""
+    assert (
+        cfg.plan_config.horizon * cfg.plan_config.action_block
+        <= cfg.eval.eval_budget
+    ), 'Planning horizon must be smaller than or equal to eval_budget'
+
+    # create world environment
+    if cfg.world.get('max_episode_steps') is None:
+        cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
+    image_size = cfg.eval.get('img_size', 224)
+    world = swm.World(**cfg.world, image_shape=(image_size, image_size))
+
+    # create the transform
+    img_dtype = torch.bfloat16 if cfg.get('bf16', False) else torch.float32
+    transform = {
+        key: img_transform(cfg, img_dtype)
+        for key in cfg.eval.get('image_keys', ['pixels', 'goal'])
+    }
+
+    dataset = get_dataset(cfg, cfg.eval.dataset_name)
+    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
+
+    process = {}
+    for col in cfg.dataset.keys_to_cache:
+        if col in ['pixels']:
+            continue
+        processor = preprocessing.StandardScaler()
+        col_data = stats_dataset.get_col_data(col)
+        col_data = col_data[~np.isnan(col_data).any(axis=1)]
+        processor.fit(col_data)
+        process[col] = processor
+
+        if col != 'action':
+            process[f'goal_{col}'] = process[col]
+
+    # -- run evaluation
+    policy = cfg.get('policy', 'random')
+
+    if policy != 'random':
+        model = swm.wm.utils.load_pretrained(cfg.policy)
+        if cfg.get('bf16', False):
+            model = model.to(torch.bfloat16)
+        model = model.to(cfg.solver.get('device', 'cuda'))
+        model = model.eval()
+        model.requires_grad_(False)
+        model.interpolate_pos_encoding = True
+        if cfg.get('compile', False):
+            encoder_attr = (
+                'backbone' if hasattr(model, 'backbone') else 'encoder'
+            )
+            setattr(
+                model,
+                encoder_attr,
+                torch.compile(getattr(model, encoder_attr)),
+            )
+            model.predictor = torch.compile(model.predictor)
+        config = swm.PlanConfig(**cfg.plan_config)
+        objective = hydra.utils.instantiate(cfg.objective)
+        cost = swm.planning.ShootingCostEvaluator(model, objective)
+        solver = hydra.utils.instantiate(cfg.solver, cost=cost)
+        policy = swm.policy.WorldModelPolicy(
+            solver=solver, config=config, process=process, transform=transform
+        )
+
+    else:
+        policy = swm.policy.RandomPolicy()
+
+    results_path = (
+        Path(
+            swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy
+        ).parent
+        if cfg.policy != 'random'
+        else Path(__file__).parent
+    )
+
+    if cfg.get('subdir'):
+        results_path = results_path / 'evals' / cfg.subdir
+
+    eval_kwargs = evaluation_kwargs(cfg, dataset)
+
     world.set_policy(policy)
 
     results_path.mkdir(parents=True, exist_ok=True)
@@ -202,35 +230,18 @@ def run(cfg: DictConfig):
             enabled=cfg.get('bf16', False),
         )
         with warmup_autocast_ctx:
-            n = world.num_envs
-            world.evaluate(
-                dataset=dataset,
-                start_steps=eval_start_idx.tolist()[:n],
-                goal_offset=cfg.eval.goal_offset_steps,
-                eval_budget=cfg.eval.eval_budget,
-                episodes_idx=eval_episodes.tolist()[:n],
-                callables=OmegaConf.to_container(
-                    cfg.eval.get('callables'), resolve=True
-                ),
-                video=results_path,
-            )
+            warmup_kwargs = dict(eval_kwargs)
+            if 'episodes' in warmup_kwargs:
+                warmup_kwargs['episodes'] = world.num_envs
+            world.evaluate(**warmup_kwargs, video=results_path)
         print('Warmup done.')
 
     start_time = time.time()
     with autocast_ctx:
-        metrics = world.evaluate(
-            dataset=dataset,
-            start_steps=eval_start_idx.tolist(),
-            goal_offset=cfg.eval.goal_offset_steps,
-            eval_budget=cfg.eval.eval_budget,
-            episodes_idx=eval_episodes.tolist(),
-            callables=OmegaConf.to_container(
-                cfg.eval.get('callables'), resolve=True
-            ),
-            video=results_path,
-        )
+        metrics = world.evaluate(**eval_kwargs, video=results_path)
     end_time = time.time()
 
+    world.close()
     print(metrics)
     print(f'[eval] videos saved to {results_path.resolve()}')
 

@@ -1,0 +1,4 @@
+_target_: stable_worldmodel.wm.lewm.module.MLP
+input_dim: ???
+hidden_dim: 512
+output_dim: ${embed_dim}

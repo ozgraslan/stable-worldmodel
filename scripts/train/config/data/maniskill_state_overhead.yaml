@@ -1,0 +1,11 @@
+defaults:
+  - maniskill_state
+  - _self_
+
+state_dim: 31
+state_columns:
+  - obs_agent_qpos
+  - obs_agent_qvel
+  - obs_extra_tcp_pose
+  - obs_extra_goal_pos
+  - obs_extra_obj_pose

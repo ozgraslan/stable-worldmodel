@@ -1,0 +1,24 @@
+defaults:
+  - lewm
+  - _self_
+  - override data: state
+  - override model/encoder: mlp
+
+output_model_name: state_lewm
+subdir: ${output_model_name}_${now:%Y-%m-%d_%H-%M-%S}
+num_workers: 4
+img_size: 128
+state_columns: ${data.state_columns}
+state_dim: ${data.state_dim}
+embed_dim: 192
+
+model:
+  _target_: stable_worldmodel.wm.lewm.StateLeWM
+  state_columns: ${state_columns}
+  encoder:
+    input_dim: ${state_dim}
+
+
+trainer:
+  max_steps: -1
+  max_epochs: 10

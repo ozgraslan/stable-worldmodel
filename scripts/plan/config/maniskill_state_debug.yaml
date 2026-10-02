@@ -1,0 +1,13 @@
+defaults:
+  - maniskill_state_pusht
+  - _self_
+eval:
+  num_eval: 1
+  eval_budget: 10
+plan_config:
+  horizon: 2
+solver:
+  device: cpu
+  num_samples: 8
+  topk: 2
+  n_steps: 2

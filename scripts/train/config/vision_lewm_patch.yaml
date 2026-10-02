@@ -1,0 +1,11 @@
+defaults:
+  - vision_lewm
+  - _self_
+
+output_model_name: vision_lewm_patch
+
+model:
+  _target_: stable_worldmodel.wm.lewm.LeWMPatch
+  predictor:
+    _target_: stable_worldmodel.wm.lewm.PatchPredictor
+    num_patches: ${eval:'(${img_size} // ${patch_size}) ** 2'}

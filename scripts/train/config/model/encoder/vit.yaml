@@ -1,0 +1,6 @@
+_target_: stable_pretraining.backbone.utils.vit_hf
+size: ${encoder_scale}
+patch_size: ${patch_size}
+image_size: ${img_size}
+pretrained: false
+use_mask_token: false

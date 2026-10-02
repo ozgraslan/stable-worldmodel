@@ -1,0 +1,16 @@
+state_dim: 33
+state_columns:
+  - obs_agent_qpos
+  - obs_agent_qvel
+  - obs_extra_tcp_pose
+  - obs_extra_goal_pos
+  - obs_extra_obj_pose
+  - obs_extra_goal_orientation
+  
+dataset:
+  name: overhead_state_20k.lance
+  cache_dir: null
+  num_steps: ${eval:'${wm.history_size} + ${wm.num_preds}'}
+  frameskip: 5
+  keys_to_load: ${eval:"['action'] + ${state_columns}"}
+  keys_to_cache: ${eval:"['action'] + ${state_columns}"}

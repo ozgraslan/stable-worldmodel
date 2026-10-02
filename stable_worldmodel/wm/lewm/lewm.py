@@ -11,6 +11,7 @@ class LeWM(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        rollout_layernorm: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -20,12 +21,19 @@ class LeWM(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.rollout_layernorm = rollout_layernorm
+
+    def observation(self, info):
+        """Return model inputs with batch and time axes preserved."""
+        return info['pixels']
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
         info: dict with pixels and action keys
         """
-        pixels = info['pixels'].to(next(self.encoder.parameters()).dtype)
+        pixels = self.observation(info).to(
+            next(self.encoder.parameters()).dtype
+        )
         b = pixels.size(0)
         pixels = rearrange(
             pixels, 'b t ... -> (b t) ...'
@@ -42,19 +50,26 @@ class LeWM(nn.Module):
 
     def predict(self, emb, act_emb):
         """Predict next state embedding
-        emb: (B, T, D)
+        emb: (B, T, ..., D)
         act_emb: (B, T, A_emb)
         """
         preds = self.predictor(emb, act_emb)
-        preds = self.pred_proj(rearrange(preds, 'b t d -> (b t) d'))
-        preds = rearrange(preds, '(b t) d -> b t d', b=emb.size(0))
+        shape = preds.shape[:-1]
+        preds = self.pred_proj(preds.reshape(-1, preds.size(-1)))
+        preds = preds.reshape(*shape, -1)
         return preds
+
+    def _normalize_rollout_prediction(self, prediction):
+        # getattr keeps older whole-object checkpoints compatible.
+        if getattr(self, 'rollout_layernorm', False):
+            return nn.functional.layer_norm(prediction, (prediction.size(-1),))
+        return prediction
 
     ####################
     ## Inference only ##
     ####################
 
-    def rollout(self, info, action_sequence, history_size: int = None):
+    def rollout(self, info, action_sequence, history_size: int | None = None):
         """Rollout the model given an initial info dict and action sequence.
         pixels: (B, S, H, C, h, w) — H context frames (block timesteps)
         action_sequence: (B, S, T, action_dim) — strictly-future candidates
@@ -62,14 +77,17 @@ class LeWM(nn.Module):
             blocks between the context frames (required when H > 1)
          - S is the number of action plan samples
          - T is the planning horizon
-        Returns ``info`` with ``predicted_emb`` of shape (B, S, H + T, D);
+        Returns ``info`` with ``predicted_emb`` of shape (B, S, H + T, ..., D);
         the first H entries are the encoded context frames.
+        When ``rollout_layernorm`` is enabled, each predicted latent is
+        normalized over its last feature axis without affine parameters,
+        after ``pred_proj`` and before reuse in the next step. Context
+        embeddings and ordinary ``predict`` calls are unchanged.
         """
         if history_size is None:
             history_size = getattr(self.predictor, 'num_frames', 3)
 
-        assert 'pixels' in info, 'pixels not in info_dict'
-        H = info['pixels'].size(2)
+        H = self.observation(info).size(2)
         B, S, T = action_sequence.shape[:3]
         act_past = info.get('action_history')
         if act_past is None:
@@ -91,8 +109,9 @@ class LeWM(nn.Module):
         if 'emb' not in info:
             _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
             _init = self.encode(_init)
-            info['emb'] = (
-                _init['emb'].detach().unsqueeze(1).expand(B, S, -1, -1)
+            initial_emb = _init['emb'].detach()
+            info['emb'] = initial_emb.unsqueeze(1).expand(
+                B, S, *initial_emb.shape[1:]
             )
 
         # flatten batch and sample dimensions for rollout
@@ -104,16 +123,17 @@ class LeWM(nn.Module):
         )  # (BS, H - 1 + T, A_emb); index k = block leaving frame k
 
         # rollout predictor autoregressively, one step per candidate
-        # emb_list holds individual (BS, D) frames, each with its own grad_fn
+        # Each frame retains all latent axes, with its own grad_fn.
         HS = history_size
-        emb_list = list(emb_init.unbind(dim=1))  # H tensors of shape (BS, D)
+        emb_list = list(emb_init.unbind(dim=1))  # H tensors: (BS, ..., D)
         for t in range(T):
             lo = max(0, H + t - HS)
-            emb_trunc = torch.stack(emb_list[lo:], dim=1)  # (BS, HS, D)
+            emb_trunc = torch.stack(emb_list[lo:], dim=1)  # (BS, HS, ..., D)
             act_trunc = all_act_emb[:, lo : H + t]  # (BS, HS, A_emb)
-            emb_list.append(self.predict(emb_trunc, act_trunc)[:, -1])
+            prediction = self.predict(emb_trunc, act_trunc)[:, -1]
+            emb_list.append(self._normalize_rollout_prediction(prediction))
 
-        emb = torch.stack(emb_list, dim=1)  # (BS, H + T, D)
+        emb = torch.stack(emb_list, dim=1)  # (BS, H + T, ..., D)
 
         # unflatten batch and sample dimensions
         pred_rollout = rearrange(emb, '(b s) ... -> b s ...', b=B, s=S)

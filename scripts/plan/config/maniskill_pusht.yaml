@@ -1,0 +1,52 @@
+defaults:
+  - solver: cem
+  - objective: goal_mse
+  - _self_
+  - override hydra/env: null
+world:
+  env_name: swm/ManiSkillPushT-v1
+  num_envs: ${eval.num_eval}
+  max_episode_steps: ${eval.eval_budget}
+  simulation_max_episode_steps: ${eval.eval_budget}
+  image_size: ${eval.img_size}
+  camera_name: base_camera
+  control_mode: pd_joint_delta_pos
+  sim_backend: physx_cpu
+  expert_checkpoint: ???
+  goal_step_distance: 25
+  expert_max_steps: 100
+  goal_position_tolerance: 0.02
+  goal_yaw_tolerance: 0.15
+  expert_output_dir: null
+
+dataset:
+  stats: ${eval.dataset_name}
+  keys_to_cache: [action]
+
+seed: 42
+policy: ???
+cache_dir: null
+subdir: random_goal_pusht_${now:%Y-%m-%d_%H-%M-%S}
+
+plan_config:
+  horizon: 5
+  receding_horizon: 1
+  action_block: 5
+
+
+eval:
+  image_keys: [pixels, goal]
+  source: env
+  num_eval: 8
+  eval_budget: 100
+  img_size: 224
+  dataset_name: ???
+  env_options: {}
+
+compile: false
+bf16: false
+output:
+  filename: random_goal_pusht_results.txt
+hydra:
+  run:
+    dir: ${oc.env:STABLEWM_HOME}/evals/${subdir}/hydra

@@ -1,0 +1,16 @@
+defaults:
+  - detached_lewm
+  - _self_
+  - override data: maniskill_state
+  - override model/encoder: mlp
+
+output_model_name: detached_state_lewm
+state_columns: ${data.state_columns}
+state_dim: ${data.state_dim}
+embed_dim: 192
+
+model:
+  _target_: stable_worldmodel.wm.lewm.StateLeWM
+  state_columns: ${state_columns}
+  encoder:
+    input_dim: ${state_dim}

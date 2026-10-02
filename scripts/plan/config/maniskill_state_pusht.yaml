@@ -1,0 +1,12 @@
+defaults:
+  - maniskill_pusht
+  - _self_
+state_columns: [obs_agent_qpos, obs_agent_qvel, obs_extra_tcp_pose, obs_extra_goal_pos, obs_extra_obj_pose, obs_extra_goal_orientation]
+world:
+  state_goal: true
+dataset:
+  keys_to_cache: [action, obs_agent_qpos, obs_agent_qvel, obs_extra_tcp_pose, obs_extra_goal_pos, obs_extra_obj_pose, obs_extra_goal_orientation]
+subdir: state_pusht_${now:%Y%m%d_%H%M%S}
+
+eval:
+  image_keys: []

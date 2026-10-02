@@ -1,0 +1,5 @@
+defaults:
+  - energy_landscape_overhead
+  - _self_
+# State columns are read from the checkpoint, preserving their order.
+output_dir: ${oc.env:STABLEWM_HOME}/evals/energy_landscape_state_${now:%Y%m%d_%H%M%S}

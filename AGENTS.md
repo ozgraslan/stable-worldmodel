@@ -53,6 +53,11 @@ exact packages. Some evaluation scripts explicitly select EGL.
 
 ## Experiments and conventions
 
+- Follow existing repository dataset, training, checkpoint, and evaluation
+  implementations for new baselines. Reuse their infrastructure and matching
+  experiment settings for fair comparisons; keep algorithm-specific changes
+  explicit instead of introducing parallel pipelines.
+
 - Ruff sets 79-column lines, four-space indentation, and single quotes.
   Keep code compatible with Python 3.10. Follow nearby type annotations and
   docstrings; consult `protocols.py` for shared model/planning contracts.

@@ -48,10 +48,9 @@ import torch
 
 from stable_worldmodel.policy import Policy
 
-from .env_pool import EnvPool
 from ..plot import save_panel_videos, save_video
 from ..wrapper import MegaWrapper
-
+from .env_pool import EnvPool
 
 RESET_MODES = ('auto', 'wait')
 
@@ -182,6 +181,9 @@ class World:
         Clears ``terminateds``/``truncateds`` back to all-False.
         """
         _, self.infos = self.envs.reset(seed=seed, options=options)
+        reset_policy = getattr(self.policy, 'reset', None)
+        if reset_policy is not None:
+            reset_policy()
         self.terminateds = np.zeros(self.num_envs, dtype=bool)
         self.truncateds = np.zeros(self.num_envs, dtype=bool)
 
@@ -492,8 +494,14 @@ class World:
         def on_step(world, mask):
             if frames is not None:
                 for i in range(world.num_envs):
-                    f = world.infos['pixels'][i]
-                    frame = f[-1] if f.ndim > 3 else f
+                    renderer = getattr(
+                        world.envs.envs[i].unwrapped, 'render_video', None
+                    )
+                    if renderer is not None:
+                        frame = renderer()
+                    else:
+                        f = world.infos['pixels'][i]
+                        frame = f[-1] if f.ndim > 3 else f
                     frames[i].append(np.asarray(frame).copy())
 
         def on_done(env_idx, ep_idx, world):

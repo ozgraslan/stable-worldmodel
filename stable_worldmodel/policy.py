@@ -1,7 +1,7 @@
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -271,6 +271,11 @@ class FeedForwardPolicy(BasePolicy):
         process: dict[str, Transformable] | None = None,
         transform: dict[str, Callable[[torch.Tensor], torch.Tensor]]
         | None = None,
+        history_len: int = 1,
+        action_chunk_size: int = 1,
+        history_keys: tuple[str, ...] = ('pixels',),
+        require_goal: bool = True,
+        clip_actions: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the feed-forward policy.
@@ -279,6 +284,12 @@ class FeedForwardPolicy(BasePolicy):
             model: Neural network model with a `get_action` method.
             process: Dictionary of data preprocessors for specific keys.
             transform: Dictionary of tensor transformations (e.g., image transforms).
+            history_len: Number of observations supplied to the model.
+            action_chunk_size: Distinct actions predicted/executed per call;
+                also the observation stride, matching dataset frameskip.
+            history_keys: Observation columns retained in HistoryBuffer.
+            require_goal: Keep GCBC's goal requirement; disable for plain BC.
+            clip_actions: Clip denormalized actions to environment bounds.
             **kwargs: Additional configuration parameters.
         """
         super().__init__(**kwargs)
@@ -286,12 +297,121 @@ class FeedForwardPolicy(BasePolicy):
         self.model = model.eval()
         self.process = process or {}
         self.transform = transform or {}
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in (history_len, action_chunk_size)
+        ):
+            raise ValueError(
+                'history_len and action_chunk_size must be positive'
+            )
+        self.history_len = history_len
+        self.action_chunk_size = action_chunk_size
+        self.history_keys = tuple(history_keys)
+        self.require_goal = require_goal
+        self.clip_actions = clip_actions
+        self._buffered = history_len > 1 or action_chunk_size > 1
+        self._history_buffer = None
+        self._action_buffer = None
+
+    def set_env(self, env: Any) -> None:
+        """Initialize the same per-environment history used by planning."""
+        super().set_env(env)
+        if self._buffered:
+            if not self.history_keys:
+                raise ValueError(
+                    'Buffered feed-forward policies need history_keys'
+                )
+            self._history_buffer = HistoryBuffer(
+                n_envs=env.num_envs,
+                max_len=(self.history_len - 1) * self.action_chunk_size + 1,
+                action_block=self.action_chunk_size,
+            )
+            self._action_buffer = [
+                deque(maxlen=self.action_chunk_size)
+                for _ in range(env.num_envs)
+            ]
+
+    def reset(self) -> None:
+        """Clear pending actions and history on an explicit World reset."""
+        if self._history_buffer is not None:
+            self._history_buffer.reset()
+        if self._action_buffer is not None:
+            for actions in self._action_buffer:
+                actions.clear()
+
+    def _buffered_action(self, info_dict: dict) -> torch.Tensor:
+        """Refill only empty action queues; clear history on SWM reset flags.
+
+        HistoryBuffer pads startup observations with the earliest real frame.
+        Terminated environments receive NaNs, matching WorldModelPolicy.
+        """
+        if self._history_buffer is None:
+            raise RuntimeError('Call set_env before buffered inference')
+        n_envs = self.env.num_envs
+        flush = info_dict.get('_needs_flush')
+        if flush is not None:
+            ids = [i for i in range(n_envs) if bool(flush[i])]
+            for i in ids:
+                self._action_buffer[i].clear()
+            self._history_buffer.reset(ids)
+        self._history_buffer.append(
+            {key: info_dict[key].clone() for key in self.history_keys}
+        )
+        terminated = info_dict.get('terminated')
+        dead = (
+            [False] * n_envs
+            if terminated is None
+            else [bool(terminated[i]) for i in range(n_envs)]
+        )
+        refill = [
+            i
+            for i in range(n_envs)
+            if not dead[i] and not self._action_buffer[i]
+        ]
+        if refill:
+            selected = {}
+            for key, value in info_dict.items():
+                if torch.is_tensor(value) or isinstance(value, np.ndarray):
+                    selected[key] = value[refill]
+                elif isinstance(value, list):
+                    selected[key] = [value[i] for i in refill]
+                else:
+                    selected[key] = value
+            selected.update(
+                self._history_buffer.get(self.history_len, env_ids=refill)
+            )
+            if self.action_chunk_size == 1:
+                actions = self.model.get_action(selected).unsqueeze(1)
+            else:
+                actions = self.model.get_action(
+                    selected, horizon=self.action_chunk_size
+                )
+            expected = (
+                len(refill),
+                self.action_chunk_size,
+                *self.env.single_action_space.shape,
+            )
+            if tuple(actions.shape) != expected:
+                raise ValueError(
+                    f'Expected action chunk shape {expected}, got {tuple(actions.shape)}'
+                )
+            if not torch.isfinite(actions).all():
+                raise ValueError('Model produced nonfinite actions')
+            for row, env_id in enumerate(refill):
+                self._action_buffer[env_id].extend(actions[row].detach().cpu())
+        action = torch.full(
+            (n_envs, *self.env.single_action_space.shape), float('nan')
+        )
+        for i in range(n_envs):
+            if not dead[i]:
+                action[i] = self._action_buffer[i].popleft()
+        return action
 
     def get_action(self, info_dict: dict, **kwargs: Any) -> np.ndarray:
         """Get action via a forward pass through the neural network model.
 
         Args:
-            info_dict: Current state information containing at minimum a 'goal' key.
+            info_dict: Current state information; GCBC additionally requires 'goal'.
             **kwargs: Additional parameters (unused).
 
         Returns:
@@ -301,10 +421,14 @@ class FeedForwardPolicy(BasePolicy):
             AssertionError: If environment not set or 'goal' not in info_dict.
         """
         assert hasattr(self, 'env'), 'Environment not set for the policy'
-        assert 'goal' in info_dict, "'goal' must be provided in info_dict"
+        if self.require_goal:
+            assert 'goal' in info_dict, "'goal' must be provided in info_dict"
 
-        # Prepare the info dict (transforms and normalizes inputs)
+        # Consume SWM's one-shot reset signal, as WorldModelPolicy does.
+        flush = info_dict.pop('_needs_flush', None) if self._buffered else None
         info_dict = self._prepare_info(info_dict)
+        if flush is not None:
+            info_dict['_needs_flush'] = flush
 
         # Add goal_pixels key for GCBC model
         if 'goal' in info_dict:
@@ -318,16 +442,24 @@ class FeedForwardPolicy(BasePolicy):
 
         # Get action from model
         with torch.no_grad():
-            action = self.model.get_action(info_dict)
+            action = (
+                self._buffered_action(info_dict)
+                if self._buffered
+                else self.model.get_action(info_dict)
+            )
 
         # Convert to numpy
         if torch.is_tensor(action):
-            action = action.cpu().detach().numpy()
+            action = action.detach().float().cpu().numpy()
 
         # post-process action
         if 'action' in self.process:
             action = self.process['action'].inverse_transform(action)
 
+        if self.clip_actions:
+            action = np.clip(
+                action, self.env.action_space.low, self.env.action_space.high
+            )
         return action
 
 

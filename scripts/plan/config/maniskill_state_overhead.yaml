@@ -1,0 +1,13 @@
+defaults:
+  - maniskill_overhead
+  - _self_
+subdir: overhead_state_${now:%Y%m%d_%H%M%S}
+state_columns: [obs_agent_qpos, obs_agent_qvel, obs_extra_tcp_pose, obs_extra_goal_pos, obs_extra_obj_pose]
+world:
+  state_goal: true
+  goal_eef_position_tolerance: 0.02
+dataset:
+  keys_to_cache: [action, obs_agent_qpos, obs_agent_qvel, obs_extra_tcp_pose, obs_extra_goal_pos, obs_extra_obj_pose]
+
+eval:
+  image_keys: []

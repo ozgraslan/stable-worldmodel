@@ -22,20 +22,21 @@ from stable_worldmodel.protocols import Dynamics, Objective
 def flat_goal_encode(model: Dynamics, info_dict: dict) -> torch.Tensor:
     """Encode the goal for models whose latent is a single flat tensor.
 
-    Behavior-preserving extraction of the goal-encoding branch in
-    ``LeWM.get_cost``; also covers ``PLDM``. Pair with :class:`GoalMSE`.
+    Map ``goal`` images and ``goal_<column>`` numeric observations to model
+    inputs. Goals describe observations, not actions. Pair with :class:`GoalMSE`.
     """
-    assert 'goal' in info_dict, 'goal not in info_dict'
+    # Build goal inputs only from goal fields. Never silently substitute
+    # current observations for missing numeric goal columns.
+    goal = {
+        k[len('goal_') :]: v[:, 0]
+        for k, v in info_dict.items()
+        if k.startswith('goal_') and k != 'goal_emb' and torch.is_tensor(v)
+    }
+    if 'goal' in info_dict:
+        goal['pixels'] = info_dict['goal'][:, 0]
 
-    goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
-    goal['pixels'] = goal['goal']
-
-    for k in info_dict:
-        if k.startswith('goal_'):
-            goal[k[len('goal_') :]] = goal.pop(k)
-
-    goal.pop('action')
-    goal.pop('action_history', None)  # past blocks are context, not goal
+    goal.pop('action', None)
+    goal.pop('action_history', None)
     goal = model.encode(goal)
     return goal['emb']
 

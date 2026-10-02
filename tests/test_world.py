@@ -403,6 +403,35 @@ class TestNeedsFlush:
 
 
 class TestEvaluate:
+    @pytest.mark.parametrize('custom_video', [False, True])
+    def test_video_renderer_preserves_policy_pixels(
+        self, monkeypatch, tmp_path, custom_video
+    ):
+        world = _make_world(num_envs=1, max_steps=2)
+        policy = RecordingPolicy()
+        world.set_policy(policy)
+        env = world.envs.envs[0].unwrapped
+        if custom_video:
+            env.render_video = lambda: np.full(
+                (3, 9, 3), env._step_count + 10, dtype=np.uint8
+            )
+        saved = []
+        monkeypatch.setattr(
+            'stable_worldmodel.world.world.save_video',
+            lambda path, frames: saved.append((path, frames)),
+        )
+        world.evaluate(episodes=2, seed=0, video=tmp_path)
+        assert [path.name for path, _ in saved] == [
+            'episode_0.mp4',
+            'episode_1.mp4',
+        ]
+        for _, frames in saved:
+            assert len(frames) == 3
+            for step, frame in enumerate(frames):
+                assert frame.shape == (3, 9 if custom_video else 3, 3)
+                assert np.all(frame == step + (10 if custom_video else 0))
+        assert policy.last_infos['pixels'].shape[-3:] == (3, 3, 3)
+
     def test_evaluate_returns_results(self):
         world = _make_world(num_envs=2, max_steps=2)
         policy = RecordingPolicy()

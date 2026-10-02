@@ -1,0 +1,19 @@
+defaults:
+  - maniskill_state_overhead
+  - _self_
+
+subdir: overhead_bc_${now:%Y%m%d_%H%M%S}
+device: ${solver.device}
+normalization_path: null  # Defaults to normalization.json beside checkpoint.
+
+world:
+  # Evaluate native task completion, without expert-selected intermediate goals.
+  expert_checkpoint: null
+  state_goal: false
+
+eval:
+  source: env
+  save_video: true
+
+output:
+  filename: bc_results.txt

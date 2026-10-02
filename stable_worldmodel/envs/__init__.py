@@ -226,3 +226,10 @@ try:
     from stable_worldmodel.envs import ale  # noqa: F401
 except ImportError:
     pass
+
+# String entry points keep ManiSkill and simulator initialization optional.
+register(
+    id='swm/ManiSkillPushT-v1',
+    entry_point='stable_worldmodel.envs.maniskill.pusht:PushTSWMEnv',
+    max_episode_steps=100,
+)

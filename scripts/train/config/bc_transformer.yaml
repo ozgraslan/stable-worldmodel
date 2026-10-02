@@ -1,0 +1,16 @@
+defaults:
+  - bc
+  - _self_
+
+output_model_name: state_bc_transformer_overhead
+
+model:
+  architecture: transformer
+  # Use the state world model's embedding width and transformer settings.
+  transformer:
+    embed_dim: 192
+    depth: 6
+    heads: 16
+    dim_head: 64
+    mlp_dim: 2048
+    dropout: 0.1

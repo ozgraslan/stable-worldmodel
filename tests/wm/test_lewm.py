@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 
-from stable_worldmodel.planning import ShootingCostEvaluator, GoalMSE
+from stable_worldmodel.planning import GoalMSE, ShootingCostEvaluator
 from stable_worldmodel.protocols import Dynamics
 from stable_worldmodel.wm.lewm.lewm import LeWM
 
@@ -273,3 +273,60 @@ def test_rollout_rejects_multiframe_pixels_without_action_history():
     info = _rollout_info(hist_len=3)
     with pytest.raises(AssertionError, match='action_history'):
         model.rollout(info, torch.randn(RB, RS, 4, RD))
+
+
+@pytest.mark.parametrize('patches', [None, 3])
+def test_rollout_layernorm_normalizes_predictions_before_feedback(patches):
+    class Predictor(nn.Module):
+        num_frames = 3
+
+        def forward(self, emb, actions):
+            if emb.ndim == 4:
+                actions = actions.unsqueeze(-2)
+            return (emb + actions).cumsum(dim=1)
+
+    torch.manual_seed(0)
+    model = LeWM(
+        encoder=nn.Identity(),
+        predictor=Predictor(),
+        action_encoder=nn.Identity(),
+        pred_proj=nn.Linear(RD, RD),
+        rollout_layernorm=True,
+    )
+    latent_shape = (RD,) if patches is None else (patches, RD)
+    initial = torch.randn(RB, RS, 1, *latent_shape)
+    info = _rollout_info(hist_len=1, emb=initial)
+    actions = torch.randn(RB, RS, 4, RD, requires_grad=True)
+    actual = model.rollout(info, actions)['predicted_emb']
+
+    history = [initial.reshape(RB * RS, *latent_shape)]
+    flat_actions = actions.reshape(RB * RS, 4, RD)
+    for step in range(4):
+        start = max(0, len(history) - 3)
+        prediction = model.predict(
+            torch.stack(history[start:], dim=1),
+            flat_actions[:, start : step + 1],
+        )[:, -1]
+        history.append(nn.functional.layer_norm(prediction, (RD,)))
+    expected = torch.stack(history, dim=1).reshape_as(actual)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual[:, :, :1], initial)
+    torch.testing.assert_close(
+        actual[:, :, 1:].mean(dim=-1),
+        torch.zeros_like(actual[:, :, 1:, ..., 0]),
+        atol=1e-6,
+        rtol=0,
+    )
+    actual[:, :, -1, ..., 0].sum().backward()
+    assert torch.isfinite(actions.grad).all()
+    assert actions.grad.abs().sum() > 0
+
+
+def test_rollout_without_layernorm_attribute_matches_default():
+    model = _toy_model()
+    info = _rollout_info(hist_len=1)
+    actions = torch.randn(RB, RS, 3, RD)
+    expected = model.rollout(dict(info), actions)['predicted_emb']
+    del model.rollout_layernorm  # Older whole-object checkpoints.
+    actual = model.rollout(dict(info), actions)['predicted_emb']
+    torch.testing.assert_close(actual, expected)

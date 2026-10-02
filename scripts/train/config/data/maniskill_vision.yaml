@@ -1,0 +1,7 @@
+dataset:
+  name: overhead_rgb_1000.lance
+  cache_dir: null
+  num_steps: ${eval:'${wm.history_size} + ${wm.num_preds}'}
+  frameskip: 5
+  keys_to_load: [pixels, action]
+  keys_to_cache: [action]

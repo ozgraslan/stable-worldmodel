@@ -1,0 +1,14 @@
+defaults:
+  - maniskill_pusht
+  - _self_
+subdir: overhead_vision_${now:%Y%m%d_%H%M%S}
+world:
+  env_id: OverheadPushT-v1
+  camera_name: overhead_camera
+  image_size: 128
+  control_mode: pd_ee_delta_xy
+  expert_policy_type: rgb
+  expert_encoder: spatial_softmax
+  goal_eef_position_tolerance: 0.02
+eval:
+  img_size: 128

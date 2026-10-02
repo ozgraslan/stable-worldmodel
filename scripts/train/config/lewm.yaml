@@ -2,6 +2,7 @@ defaults:
   - _self_
   - launcher: local
   - data: pusht
+  - model/encoder: vit
 
 output_model_name: lewm
 
@@ -17,6 +18,7 @@ save_step_interval: 5000
 
 trainer:
   default_root_dir: ${oc.env:STABLEWM_HOME}/checkpoints/${subdir}/pl_trainer
+  max_epochs: -1 
   max_steps: 100000
   devices: auto
   accelerator: gpu
@@ -43,13 +45,8 @@ wm:
 
 model:
   _target_: stable_worldmodel.wm.lewm.LeWM
-  encoder:
-    _target_: stable_pretraining.backbone.utils.vit_hf
-    size: ${encoder_scale}
-    patch_size: ${patch_size}
-    image_size: ${img_size}
-    pretrained: false
-    use_mask_token: false
+  # Normalize predicted latents before each autoregressive rollout step.
+  rollout_layernorm: false
   predictor:
     _target_: stable_worldmodel.wm.lewm.module.Predictor
     num_frames: ${wm.history_size}

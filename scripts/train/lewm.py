@@ -1,20 +1,40 @@
 import os
+from functools import partial
 from pathlib import Path
 
 import hydra
 import lightning as pl
 import stable_pretraining as spt
-from stable_pretraining import data as dt
-import stable_worldmodel as swm
 import torch
+from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
+from stable_pretraining import data as dt
 
-from functools import partial
+import stable_worldmodel as swm
 from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import SIGReg
-from lightning.pytorch.callbacks import Callback
 from stable_worldmodel.wm.utils import save_pretrained
+
+
+def _vit_embed_dim(scale: str) -> int:
+    dims = {
+        'tiny': 192,
+        'small': 384,
+        'base': 768,
+        'large': 1024,
+        'huge': 1280,
+    }
+    if scale not in dims:
+        raise ValueError(
+            f"Unknown ViT encoder scale '{scale}'. "
+            f'Expected one of {sorted(dims)}.'
+        )
+    return dims[scale]
+
+
+if not OmegaConf.has_resolver('vit_embed_dim'):
+    OmegaConf.register_new_resolver('vit_embed_dim', _vit_embed_dim)
 
 
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
@@ -67,7 +87,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
     output = self.model.encode(batch)
 
-    emb = output['emb']  # (B, T, D)
+    emb = output['emb']  # (B, T, ..., D)
     act_emb = output['act_emb']
 
     ctx_emb = emb[:, :ctx_len]
@@ -78,7 +98,9 @@ def lejepa_forward(self, batch, stage, cfg):
 
     # LeWM loss
     output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
-    output['sigreg_loss'] = self.sigreg(emb.transpose(0, 1))
+    # Patch models retain the CLS embedding for the standard LEWM regularizer.
+    reg_emb = output.get('cls_emb', emb)
+    output['sigreg_loss'] = self.sigreg(reg_emb.transpose(0, 1))
     output['loss'] = output['pred_loss'] + lambd * output['sigreg_loss']
 
     losses_dict = {
@@ -96,7 +118,8 @@ def run(cfg):
 
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop('name')
-    cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
+    dataset_dir = os.environ.get('LOCAL_DATASET_DIR', None)
+    cache_dir = dataset_cfg.pop('cache_dir', None) or dataset_dir
     print(
         f'Loading dataset "{dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
     )
@@ -104,9 +127,9 @@ def run(cfg):
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
     transforms = [
-        get_img_preprocessor(
-            source='pixels', target='pixels', img_size=cfg.img_size
-        )
+        get_img_preprocessor(source=col, target=col, img_size=cfg.img_size)
+        for col in cfg.data.dataset.keys_to_load
+        if col.startswith('pixels')
     ]
 
     with open_dict(cfg):
@@ -210,7 +233,6 @@ def run(cfg):
     )
 
     manager()
-    return
 
 
 if __name__ == '__main__':

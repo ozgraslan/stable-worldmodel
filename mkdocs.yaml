@@ -21,6 +21,7 @@ nav:
   - baselines.md
   - Environments:
       - envs/pusht.md
+      - envs/maniskill.md
       - envs/dmc.md
       - envs/ogb.md
       - envs/tworoom.md
@@ -36,6 +37,7 @@ nav:
   - Tutorial:
       - tutorial/collect_data.md
       - tutorial/training_wm.md
+      - tutorial/energy_landscape.md
       - tutorial/new_env.md
   - API:
       - api/world.md
