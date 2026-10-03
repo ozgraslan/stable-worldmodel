@@ -37,6 +37,7 @@ plan_config:
 eval:
   image_keys: [pixels, goal]
   source: env
+  start_from_beginning: false
   num_eval: 8
   eval_budget: 100
   img_size: 224

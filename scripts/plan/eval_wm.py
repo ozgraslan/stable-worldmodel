@@ -68,10 +68,15 @@ def evaluation_kwargs(cfg, dataset):
     """Select native World.evaluate inputs for reset or dataset evaluation."""
     source = cfg.eval.get('source', 'dataset')
     if source == 'env':
+        options = OmegaConf.to_container(cfg.eval.get('env_options', {}))
+        if cfg.world.get('expert_checkpoint') is not None:
+            options['start_from_beginning'] = bool(
+                cfg.eval.get('start_from_beginning', False)
+            )
         return {
             'episodes': cfg.eval.num_eval,
             'seed': cfg.seed,
-            'options': OmegaConf.to_container(cfg.eval.get('env_options', {})),
+            'options': options,
         }
     if source != 'dataset':
         raise ValueError(f'Unknown evaluation source: {source!r}')

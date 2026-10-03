@@ -15,6 +15,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
+
 import stable_worldmodel as swm
 
 
@@ -126,9 +127,11 @@ def select_dataset_eval_rows(cfg, dataset, ep_indices):
     eval_start_idx = step_idx[selected_indices]
     goal_offsets = cfg.eval.goal_offset_steps
     if cfg.eval.get('goal_from_episode_end', False):
-        goal_offsets = np.array(
-            [episode_len_dict[ep_id] for ep_id in eval_episodes]
-        ) - eval_start_idx - 1
+        goal_offsets = (
+            np.array([episode_len_dict[ep_id] for ep_id in eval_episodes])
+            - eval_start_idx
+            - 1
+        )
     return eval_episodes, eval_start_idx, goal_offsets
 
 
@@ -156,8 +159,16 @@ def _run_generated_case(world, policy, seed, options, horizon) -> int | None:
     return None
 
 
-def _generate_expert_case(world, expert, seed, options, expert_horizon):
-    """Roll out an expert and capture its complete successful trajectory."""
+def _generate_expert_case(
+    world,
+    expert,
+    seed,
+    options,
+    expert_horizon,
+    start_from_beginning=True,
+    min_solution_steps=1,
+):
+    """Select a start and a successful expert suffix with its final goal."""
     world.set_policy(expert)
     world.reset(seed=seed, options=options)
     actions = []
@@ -184,13 +195,23 @@ def _generate_expert_case(world, expert, seed, options, expert_horizon):
             break
     if success_step is None:
         return None
+    if success_step < min_solution_steps:
+        return None
+    start_step = 0
+    if not start_from_beginning:
+        start_step = int(
+            np.random.default_rng(seed).integers(
+                success_step - min_solution_steps + 1
+            )
+        )
     return {
         'seed': seed,
-        'start': states[0],
+        'start_step': start_step,
+        'start': states[start_step],
         'goal': states[success_step],
         'expert_final_state': expert_final_state,
-        'witness_actions': actions[:success_step],
-        'expert_success_step': success_step,
+        'witness_actions': actions[start_step:success_step],
+        'expert_success_step': success_step - start_step,
     }
 
 
@@ -199,6 +220,9 @@ def generate_env_eval_cases(cfg, world_kwargs) -> list[dict]:
     generated = cfg.eval.generated
     expert_horizon = int(cfg.eval.eval_budget)
     min_steps = int(generated.get('min_solution_steps', 5))
+    if min_steps < 1:
+        raise ValueError('min_solution_steps must be positive')
+    start_from_beginning = bool(cfg.eval.get('start_from_beginning', False))
     min_expert_distance = float(
         generated.get(
             'min_expert_trajectory_distance',
@@ -211,7 +235,8 @@ def generate_env_eval_cases(cfg, world_kwargs) -> list[dict]:
     progress_interval = int(generated.get('progress_interval', 25))
     replay_tolerance = float(generated.get('replay_tolerance', 1e-5))
     specification = {
-        'schema_version': 5,
+        'schema_version': 6,
+        'start_from_beginning': start_from_beginning,
         'env_name': world_kwargs['env_name'],
         'env_type': world_kwargs.get('env_type'),
         'base_seed': int(cfg.seed),
@@ -234,7 +259,7 @@ def generate_env_eval_cases(cfg, world_kwargs) -> list[dict]:
         env_slug = world_kwargs['env_name'].replace('/', '_')
         cache_path = cache_root / (
             f'{env_slug}_seed{cfg.seed}_n{cfg.eval.num_eval}'
-            f'_full_b{cfg.eval.eval_budget}'
+            f'_begin{int(start_from_beginning)}_b{cfg.eval.eval_budget}'
             f'_min{min_steps}_d{min_expert_distance:g}'
             f'_r{random_horizon}x{random_trials}.json'
         )
@@ -247,8 +272,7 @@ def generate_env_eval_cases(cfg, world_kwargs) -> list[dict]:
             and len(cases) == cfg.eval.num_eval
         ):
             print(
-                f'[eval] loaded {len(cases)} generated cases from '
-                f'{cache_path}'
+                f'[eval] loaded {len(cases)} generated cases from {cache_path}'
             )
             return cases
 
@@ -284,6 +308,8 @@ def generate_env_eval_cases(cfg, world_kwargs) -> list[dict]:
                 seed,
                 options,
                 expert_horizon,
+                start_from_beginning=start_from_beginning,
+                min_solution_steps=min_steps,
             )
             if (
                 eval_case is None
@@ -377,10 +403,7 @@ def render_generated_references(world_kwargs, generated_cases, base_options):
     reference_kwargs = dict(world_kwargs)
     reference_kwargs['num_envs'] = 1
     reference_kwargs['max_episode_steps'] = (
-        max(
-            len(eval_case['witness_actions'])
-            for eval_case in generated_cases
-        )
+        max(len(eval_case['witness_actions']) for eval_case in generated_cases)
         + 1
     )
     reference_kwargs['add_pixels'] = True
@@ -406,13 +429,11 @@ def render_generated_references(world_kwargs, generated_cases, base_options):
                 )
             states = [capture()]
             for action in eval_case['witness_actions']:
-                _, _, _, _, reference_world.infos = (
-                    reference_world.envs.step(np.asarray(action)[None, ...])
+                _, _, _, _, reference_world.infos = reference_world.envs.step(
+                    np.asarray(action)[None, ...]
                 )
                 frames.append(
-                    np.asarray(
-                        reference_world.infos['pixels'][0, -1]
-                    ).copy()
+                    np.asarray(reference_world.infos['pixels'][0, -1]).copy()
                 )
                 states.append(capture())
             trajectories.append(np.stack(frames))
@@ -502,9 +523,7 @@ def run(cfg: DictConfig):
         else get_dataset(cfg, stats_dataset_name)
     )
     col_name = get_episode_index_column(dataset)
-    episode_idx = np.asarray(
-        stats_dataset.get_col_data(col_name)
-    ).reshape(-1)
+    episode_idx = np.asarray(stats_dataset.get_col_data(col_name)).reshape(-1)
     ep_indices, _ = np.unique(episode_idx, return_index=True)
 
     process = {}
@@ -522,7 +541,7 @@ def run(cfg: DictConfig):
 
     # -- run evaluation
     policy = cfg.get('policy', 'random')
-    print("Policy:", policy)
+    print('Policy:', policy)
 
     if policy != 'random':
         model = swm.wm.utils.load_pretrained(cfg.policy)
@@ -607,12 +626,17 @@ def run(cfg: DictConfig):
     start_time = time.time()
     with autocast_ctx:
         if eval_source == 'env':
+            env_options = OmegaConf.to_container(
+                cfg.eval.get('env_options', {}), resolve=True
+            )
+            if world_kwargs.get('expert_checkpoint') is not None:
+                env_options['start_from_beginning'] = bool(
+                    cfg.eval.get('start_from_beginning', False)
+                )
             metrics = world.evaluate(
                 episodes=cfg.eval.num_eval,
                 seed=cfg.seed,
-                options=OmegaConf.to_container(
-                    cfg.eval.get('env_options', {}), resolve=True
-                ),
+                options=env_options,
                 video=results_path,
             )
         elif eval_source == 'generated_env':

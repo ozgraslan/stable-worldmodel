@@ -2,7 +2,7 @@
 
 Gymnasium imports this module via swm/ManiSkillPushT-v1. With expert_checkpoint,
 goal images are selected from a deterministic PPO trajectory and the environment
-is reset to the same start before planning. Without an expert, synthetic goal
+is restored to a configurable trajectory start before planning. Without an expert, synthetic goal
 rendering places the T on the target without advancing physics.
 The default CPU physics backend allows SWM to
 own several independent scenes; planning and rendering can still use a GPU.
@@ -245,6 +245,8 @@ class PushTSWMEnv(gym.Env):
             self._expert.eval()
 
     def _expert_goal(self, obs, seed, options):
+        options = dict(options or {})
+        start_from_beginning = options.pop('start_from_beginning', True)
         base = self.env.unwrapped
         initial_state = base.get_state().clone()
         frames = [self._camera(obs)]
@@ -255,6 +257,7 @@ class PushTSWMEnv(gym.Env):
         if self.goal_eef_position_tolerance is not None:
             eef_positions.append(single(base.agent.tcp.pose.p))
         actions = []
+        observations = [self._observation(obs)] if self.state_goal else []
         success = False
         for _ in range(self.expert_max_steps):
             with torch.inference_mode():
@@ -280,17 +283,21 @@ class PushTSWMEnv(gym.Env):
             poses.append(single(base.tee.pose.raw_pose))
             if self.goal_eef_position_tolerance is not None:
                 eef_positions.append(single(base.agent.tcp.pose.p))
-            if self.state_goal and len(actions) <= self.goal_step_distance:
-                self.goal_observation = {
-                    key: single(value).astype(np.float32)
-                    for key, (_, value) in named_observation_leaves(
-                        obs
-                    ).items()
-                }
+            if self.state_goal:
+                observations.append(self._observation(obs))
             success = bool(single(info['success']))
             if bool(single(terminated)) or bool(single(truncated)):
                 break
-        index = min(self.goal_step_distance, len(actions))
+        start_index = 0
+        if not start_from_beginning:
+            start_index = int(
+                self.np_random.integers(
+                    max(0, len(actions) - self.goal_step_distance) + 1
+                )
+            )
+        index = start_index + min(self.goal_step_distance, len(actions))
+        if self.state_goal:
+            self.goal_observation = observations[index]
         self._goal = frames[index].copy()
         self._goal_pose = torch.as_tensor(poses[index], device=base.device)[
             None
@@ -300,8 +307,9 @@ class PushTSWMEnv(gym.Env):
                 eef_positions[index], device=base.device
             )[None]
         self._expert_metadata = {
-            'goal_step_distance': index,
-            'expert_length': len(actions),
+            'goal_step_distance': index - start_index,
+            'expert_start_step': start_index,
+            'expert_length': len(actions) - start_index,
             'expert_task_success': success,
         }
         # Reset also restores controller targets and time-limit counters, which
@@ -314,9 +322,9 @@ class PushTSWMEnv(gym.Env):
             atol=1e-6,
             msg='Expert and LEWM resets must reproduce the same start',
         )
-        self.expert_actions = np.stack(actions)
-        self.expert_frames = np.stack(frames)
-        self.expert_goal_index = index
+        self.expert_actions = np.stack(actions[start_index:])
+        self.expert_frames = np.stack(frames[start_index:])
+        self.expert_goal_index = index - start_index
         # Replay the actual commands, including the final post-action frame.
         for action in actions[:index]:
             obs, _, _, _, _ = self.env.step(
@@ -341,6 +349,17 @@ class PushTSWMEnv(gym.Env):
         torch.testing.assert_close(
             base.get_state(), initial_state, rtol=0, atol=1e-6
         )
+        # Replay the prefix to preserve both physics and controller targets.
+        self._executed_actions = [
+            action.copy() for action in actions[:start_index]
+        ]
+        for action in self._executed_actions:
+            obs, _, _, _, info = base.step(
+                torch.as_tensor(action, device=base.device)[None]
+            )
+        # Prefix replay is setup; planning gets a fresh time-limit budget.
+        if hasattr(base, '_elapsed_steps'):
+            base._elapsed_steps.zero_()
         if self.expert_output_dir:
             output = Path(self.expert_output_dir)
             output.mkdir(parents=True, exist_ok=True)
@@ -350,6 +369,7 @@ class PushTSWMEnv(gym.Env):
                 action=np.stack(actions),
                 obj_pose=np.stack(poses),
                 goal_index=index,
+                start_index=start_index,
                 requested_goal_step_distance=self.goal_step_distance,
                 task_success=success,
                 seed=seed,
@@ -449,11 +469,17 @@ class PushTSWMEnv(gym.Env):
         if seed is None:
             seed = int(self.np_random.integers(0, 2**31 - 1))
         self._evaluation_seed = seed
+        options = dict(options or {})
+        start_from_beginning = options.pop('start_from_beginning', True)
         self._evaluation_options = copy.deepcopy(options)
         self._executed_actions = []
         obs, info = self.env.reset(seed=seed, options=options)
         if self._expert is not None:
-            obs, info = self._expert_goal(obs, seed, options)
+            obs, info = self._expert_goal(
+                obs,
+                seed,
+                {**options, 'start_from_beginning': start_from_beginning},
+            )
         observation = self._observation(obs)
         if self._expert is None:
             self._goal = self._render_goal()

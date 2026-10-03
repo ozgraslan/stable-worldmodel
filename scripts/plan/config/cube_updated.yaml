@@ -37,8 +37,9 @@ eval:
   env_options:
     render_goal: true
   num_eval: 50
-  # Used only by dataset source; generated_env uses the full expert rollout.
+  # Dataset only; generated_env keeps the expert final goal.
   goal_offset_steps: 25
+  # Expert rollouts and datasets: false samples a valid intermediate start.
   start_from_beginning: false
   goal_from_episode_end: false
   eval_budget: 50

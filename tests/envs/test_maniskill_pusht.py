@@ -201,7 +201,12 @@ class AdapterTests(unittest.TestCase):
                     {'success': torch.tensor([self.steps == 3])},
                 )
 
-        for requested, expected in [(2, 2), (5, 3)]:
+        for requested, expected, beginning, start in [
+            (2, 2, True, 0),
+            (5, 3, True, 0),
+            (2, 3, False, 1),
+            (5, 3, False, 0),
+        ]:
             with self.subTest(requested=requested):
                 scene = ExpertScene()
                 with patch(
@@ -215,17 +220,26 @@ class AdapterTests(unittest.TestCase):
                     get_action=lambda *args, **kwargs: torch.zeros(1, 2)
                 )
                 env.state_goal = True
-                obs, info = env.reset(seed=42)
+                obs, info = env.reset(
+                    seed=0, options={'start_from_beginning': beginning}
+                )
                 np.testing.assert_array_equal(
                     env.goal_observation['obs_agent_qpos'],
                     [expected, expected],
                 )
-                np.testing.assert_array_equal(obs['obs_agent_qpos'], [0, 0])
-                self.assertEqual(scene.steps, 0)
-                self.assertTrue((env.render() == 0).all())
+                np.testing.assert_array_equal(
+                    obs['obs_agent_qpos'], [start, start]
+                )
+                self.assertEqual(scene.steps, start)
+                self.assertTrue((env.render() == start).all())
                 self.assertTrue((info['goal'] == expected).all())
-                self.assertEqual(info['goal_step_distance'], expected)
-                self.assertEqual(info['expert_length'], 3)
+                self.assertEqual(info['goal_step_distance'], expected - start)
+                self.assertEqual(info['expert_start_step'], start)
+                self.assertEqual(info['expert_length'], 3 - start)
+                self.assertEqual(len(env._executed_actions), start)
+                self.assertEqual(env.expert_goal_index, expected - start)
+                self.assertEqual(len(env.expert_actions), 3 - start)
+                self.assertTrue((env.expert_frames[0] == start).all())
                 self.assertTrue(info['expert_task_success'])
                 self.assertTrue(env.replay_report['passed'])
                 self.assertEqual(env.replay_report['pixel_max_error'], 0)
