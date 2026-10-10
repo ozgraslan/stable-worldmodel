@@ -11,7 +11,7 @@ class LeWM(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
-        rollout_layernorm: bool = False,
+        rollout_layernorm=None,
         **kwargs,
     ):
         super().__init__()
@@ -21,7 +21,7 @@ class LeWM(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
-        self.rollout_layernorm = rollout_layernorm
+        self.rollout_layernorm = rollout_layernorm or nn.Identity()
 
     def observation(self, info):
         """Return model inputs with batch and time axes preserved."""
@@ -48,22 +48,19 @@ class LeWM(nn.Module):
 
         return info
 
-    def predict(self, emb, act_emb):
+    def predict(self, info):
         """Predict next state embedding
         emb: (B, T, ..., D)
         act_emb: (B, T, A_emb)
         """
+        emb = info['emb']
+        act_emb = info['act_emb']
         preds = self.predictor(emb, act_emb)
         shape = preds.shape[:-1]
         preds = self.pred_proj(preds.reshape(-1, preds.size(-1)))
         preds = preds.reshape(*shape, -1)
-        return preds
-
-    def _normalize_rollout_prediction(self, prediction):
-        # getattr keeps older whole-object checkpoints compatible.
-        if getattr(self, 'rollout_layernorm', False):
-            return nn.functional.layer_norm(prediction, (prediction.size(-1),))
-        return prediction
+        info['preds'] = preds
+        return info
 
     ####################
     ## Inference only ##
@@ -130,8 +127,13 @@ class LeWM(nn.Module):
             lo = max(0, H + t - HS)
             emb_trunc = torch.stack(emb_list[lo:], dim=1)  # (BS, HS, ..., D)
             act_trunc = all_act_emb[:, lo : H + t]  # (BS, HS, A_emb)
-            prediction = self.predict(emb_trunc, act_trunc)[:, -1]
-            emb_list.append(self._normalize_rollout_prediction(prediction))
+            prediction = self.predict(
+                {'emb': emb_trunc, 'act_emb': act_trunc}
+            )['preds'][:, -1]
+            normalizer = getattr(self, 'rollout_layernorm', None)
+            if normalizer is not None:
+                prediction = normalizer(prediction)
+            emb_list.append(prediction)
 
         emb = torch.stack(emb_list, dim=1)  # (BS, H + T, ..., D)
 

@@ -13,6 +13,7 @@ from stable_pretraining import data as dt
 
 import stable_worldmodel as swm
 from stable_worldmodel.data import column_normalizer as get_column_normalizer
+from stable_worldmodel.wm.diagnostics import encoder_gradient_diagnostics
 from stable_worldmodel.wm.loss import SIGReg
 from stable_worldmodel.wm.utils import save_pretrained
 
@@ -90,11 +91,12 @@ def lejepa_forward(self, batch, stage, cfg):
     emb = output['emb']  # (B, T, ..., D)
     act_emb = output['act_emb']
 
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
+    ctx_info = {}
+    ctx_info['emb'] = emb[:, :ctx_len]
+    ctx_info['act_emb'] = act_emb[:, :ctx_len]
 
     tgt_emb = emb[:, n_preds:]  # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act)  # pred
+    pred_emb = self.model.predict(ctx_info)['preds']  # pred
 
     # LeWM loss
     output['pred_loss'] = (pred_emb - tgt_emb).pow(2).mean()
@@ -107,6 +109,27 @@ def lejepa_forward(self, batch, stage, cfg):
         f'{stage}/{k}': v.detach() for k, v in output.items() if 'loss' in k
     }
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
+
+    interval = cfg.get('gradient_diagnostics_interval', 100)
+    if stage == 'fit' and torch.is_grad_enabled() and interval > 0:
+        step = self.global_step
+        if step % interval == 0 and step != getattr(
+            self, '_last_gradient_diagnostics_step', None
+        ):
+            diagnostics = encoder_gradient_diagnostics(
+                output['pred_loss'],
+                output['sigreg_loss'],
+                self.model.encoder.parameters(),
+                lambd,
+            )
+            self.log_dict(
+                {f'{stage}/{k}': v for k, v in diagnostics.items()},
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+            # Log only once per optimizer step with gradient accumulation.
+            self._last_gradient_diagnostics_step = step
     return output
 
 
@@ -168,9 +191,18 @@ def run(cfg):
     ##       model / optim      ##
     ##############################
 
-    world_model = hydra.utils.instantiate(cfg.model)
+    model_cfg = cfg.model.copy()
+    with open_dict(model_cfg):
+        compile_model = model_cfg.pop('compile', False)
+    world_model = hydra.utils.instantiate(model_cfg)
+    if compile_model:
+        world_model.encode = torch.compile(world_model.encode)
+        world_model.predict = torch.compile(world_model.predict)
 
-    total_steps = cfg.trainer.max_epochs * len(train)
+    max_epochs = cfg.trainer.max_epochs
+    total_steps = (
+        max_epochs * len(train) if max_epochs > 0 else cfg.trainer.max_steps
+    )
     optimizers = {
         'model_opt': {
             'modules': 'model',
@@ -224,12 +256,20 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
-    ckpt_path = run_dir / f'{cfg.output_model_name}_weights.ckpt'
+    configured_ckpt_path = cfg.get('ckpt_path', None)
+    ckpt_path = (
+        Path(configured_ckpt_path).expanduser().resolve()
+        if configured_ckpt_path
+        else run_dir / f'{cfg.output_model_name}_weights.ckpt'
+    )
+    if configured_ckpt_path and not ckpt_path.is_file():
+        raise FileNotFoundError(f'Checkpoint does not exist: {ckpt_path}')
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
         ckpt_path=ckpt_path if ckpt_path.exists() else None,
+        weights_only=False,
     )
 
     manager()

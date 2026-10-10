@@ -5,6 +5,8 @@ defaults:
   - model/encoder: vit
 
 output_model_name: lewm
+# Full Lightning checkpoint to resume from; null uses the legacy run path.
+ckpt_path: null
 
 num_workers: 6
 train_split: 0.9
@@ -15,6 +17,8 @@ encoder_scale: tiny
 embed_dim: ${vit_embed_dim:${encoder_scale}}
 dump_object: True
 save_step_interval: 5000
+# Encoder loss-gradient diagnostics at steps 0, 100, ...; 0 disables them.
+gradient_diagnostics_interval: 100
 
 trainer:
   default_root_dir: ${oc.env:STABLEWM_HOME}/checkpoints/${subdir}/pl_trainer
@@ -45,8 +49,9 @@ wm:
 
 model:
   _target_: stable_worldmodel.wm.lewm.LeWM
+  compile: false
   # Normalize predicted latents before each autoregressive rollout step.
-  rollout_layernorm: false
+  rollout_layernorm: null
   predictor:
     _target_: stable_worldmodel.wm.lewm.module.Predictor
     num_frames: ${wm.history_size}

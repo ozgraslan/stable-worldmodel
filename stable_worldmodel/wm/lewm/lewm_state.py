@@ -6,7 +6,7 @@ from einops import rearrange
 from .lewm import LeWM
 
 
-class StateLeWM(LeWM):
+class LeWMState(LeWM):
     """LeWM over normalized numeric observations instead of image patches.
 
     ``state_columns`` lists ordered vector-valued inputs to concatenate along
@@ -38,4 +38,4 @@ class StateLeWM(LeWM):
         return info
 
 
-__all__ = ['StateLeWM']
+__all__ = ['LeWMState']

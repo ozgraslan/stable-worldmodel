@@ -291,7 +291,9 @@ def test_rollout_layernorm_normalizes_predictions_before_feedback(patches):
         predictor=Predictor(),
         action_encoder=nn.Identity(),
         pred_proj=nn.Linear(RD, RD),
-        rollout_layernorm=True,
+        rollout_layernorm=torch.nn.LayerNorm(
+            RD, elementwise_affine=False, bias=False
+        ),
     )
     latent_shape = (RD,) if patches is None else (patches, RD)
     initial = torch.randn(RB, RS, 1, *latent_shape)
@@ -304,9 +306,11 @@ def test_rollout_layernorm_normalizes_predictions_before_feedback(patches):
     for step in range(4):
         start = max(0, len(history) - 3)
         prediction = model.predict(
-            torch.stack(history[start:], dim=1),
-            flat_actions[:, start : step + 1],
-        )[:, -1]
+            {
+                'emb': torch.stack(history[start:], dim=1),
+                'act_emb': flat_actions[:, start : step + 1],
+            }
+        )['preds'][:, -1]
         history.append(nn.functional.layer_norm(prediction, (RD,)))
     expected = torch.stack(history, dim=1).reshape_as(actual)
     torch.testing.assert_close(actual, expected)

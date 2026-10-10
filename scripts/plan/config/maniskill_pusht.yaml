@@ -15,6 +15,10 @@ world:
   expert_checkpoint: ???
   goal_step_distance: 25
   expert_max_steps: 100
+  expert_max_attempts: 20
+  # Reject start-goal pairs when both displacements are below these meters.
+  expert_min_object_displacement: 0.02
+  expert_min_eef_displacement: 0.02
   goal_position_tolerance: 0.02
   goal_yaw_tolerance: 0.15
   expert_output_dir: null

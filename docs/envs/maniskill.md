@@ -58,7 +58,7 @@ python scripts/plan/eval_wm.py --config-name=maniskill_state_pusht \
 
 Use `maniskill_state_overhead` for an Overhead state model. Vision models use
 `maniskill_pusht` or `maniskill_overhead`. Train 128px Overhead vision models
-with `--config-name=vision_lewm data=maniskill_vision`; the RandomGoal
+with `--config-name=lewm data=maniskill_vision`; the RandomGoal
 vision evaluation default is 224px and must match the model's training setup.
 
 The bridge generates a goal by executing the PPO expert, captures its numeric

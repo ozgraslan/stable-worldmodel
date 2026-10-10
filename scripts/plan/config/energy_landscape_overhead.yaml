@@ -1,48 +1,41 @@
-# Native overhead checkpoints, notebook energy, and shared CEM planning.
-defaults:
-  - solver: cem
-  - _self_
+# Native overhead checkpoints and expert-centered action-grid diagnostics.
 # Set this to a saved landscape.npz to render without model inference.
 landscape_file: null
 policy: ???
+# Used only to fit training normalization statistics, never to sample goals.
 dataset_name: ???
-stats_dataset: null
 cache_dir: null
 device: cuda
-# Generate goals by executing a selected visualization action in ManiSkill.
-goal_source: simulator
-# Flat grid index (row * samples + column); null selects using seed.
-goal_action_index: null
+# Reuse eval_wm.py's successful expert rollout and start/goal sampling.
+expert_checkpoint: ???
+expert_policy_type: rgb
+expert_encoder: spatial_softmax
+expert_max_steps: 100
+expert_max_attempts: 20
+expert_min_object_displacement: 0.02
+expert_min_eef_displacement: 0.02
+start_from_beginning: false
+# Center the grid with the exact intervening expert actions.
+use_expert_action_mean: false
 sim_backend: physx_cpu
-episode: 0
-start_step: 0
-history_len: 3
 # One model step packs five physical controller actions.
 action_block: 5
 # Number of repeated model predictions (notebook action_repeat).
 horizon: 1
-# Goal is the endpoint of the evaluated action sequence.
+# Separation of the expert start/goal pair must match the rollout length.
 goal_offset_steps: ${energy_rollout_steps:${horizon},${action_block}}
-play_in_reverse: false
 pose_column: obs_extra_tcp_pose
 # PandaStick XY controller maps [-1, 1] to [-0.1, 0.1] meters.
 controller_scale: 0.1
 img_size: 128
-# Dense measured surface; use samples=5 for the notebook example grid.
-samples: 41
-# Grid half-width in meters per model step (dataset mode centers on GT).
-grid_size: 0.075
+# 15x15 sweep; increase samples for a denser measured surface.
+samples: 15
+# XY offset half-width in meters per model step (0.2 controller units/step).
+grid_size: 0.1
 chunk_size: 64
 # Toggle extra layer norm on context, goal, and prediction feedback.
 normalize_reps: true
 seed: 42
-solver:
-  device: ${device}
-plan_config:
-  horizon: 5
-  receding_horizon: 1
-  action_block: ${action_block}
-  history_len: ${history_len}
 output_dir: ${oc.env:STABLEWM_HOME}/evals/energy_landscape_${now:%Y%m%d_%H%M%S}
 hydra:
   job:

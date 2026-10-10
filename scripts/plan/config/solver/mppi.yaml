@@ -1,0 +1,11 @@
+_target_: stable_worldmodel.planning.solver.MPPISolver
+cost: ???
+batch_size: 1
+num_samples: 300
+var_scale: 1.0
+n_steps: 30
+# Use all samples for the MPPI weighted update.
+topk: null
+temperature: 0.5
+device: cuda
+seed: ${seed}

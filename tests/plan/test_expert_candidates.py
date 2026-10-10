@@ -55,6 +55,14 @@ def test_expert_selected_across_solver_batches():
     assert parameters['solver']['topk'] == 2
     assert parameters['horizon_env_steps'] == 2
     assert {row['env_index'] for row in records} == {0, 1, 2}
+    for row in solver.diagnostics['selections']:
+        index = row['env_index']
+        assert row['initial_expert_cost'] == 0
+        assert row['initial_expert_rank'] == 1
+        assert row['last_iteration_expert_rank'] == 1
+        assert row['initial_cem_mean_cost'] == pytest.approx(
+            float(expert[index].square().sum())
+        )
     assert outputs['costs'] == [0, 0, 0]
 
 
@@ -246,3 +254,68 @@ def test_native_cem_return_rule_preserved():
         row['selected_cost'] == row['native_cem_mean_cost']
         for row in solver.diagnostics['selections']
     )
+
+
+def test_comparison_renderer_receives_final_selected_actions():
+    expert = torch.full((3, 2, 1), 100.0)
+    solver = make_solver(QuadraticCost(), expert)
+    captured = []
+    solver.comparison_renderer = lambda expert, selected, rows: (
+        captured.append((expert.clone(), selected.clone(), rows)) or []
+    )
+    outputs = solver({'target': torch.zeros_like(expert)})
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0][0], expert)
+    torch.testing.assert_close(captured[0][1], outputs['actions'])
+    assert not torch.equal(captured[0][1], expert)
+    assert solver.diagnostics['comparison_videos'] == []
+
+
+def test_comparison_renderer_denormalizes_unblocks_and_uses_global_env(
+    tmp_path,
+):
+    from scripts.plan.eval_wm_expert_candidates import ExpertComparisonRenderer
+
+    calls = []
+
+    def render(sequences, output):
+        calls.append((sequences, output))
+        return {'expert': {'final_goal_success': True}}
+
+    envs = SimpleNamespace(
+        envs=[
+            SimpleNamespace(
+                unwrapped=SimpleNamespace(
+                    planning_action_comparison=render, _executed_actions=[]
+                )
+            )
+            for _ in range(3)
+        ]
+    )
+    processor = SimpleNamespace(
+        inverse_transform=lambda actions: actions * 2 + 3
+    )
+    renderer = ExpertComparisonRenderer(
+        envs,
+        SimpleNamespace(plan_len=4),
+        processor,
+        tmp_path,
+        max_comparisons=1,
+    )
+    expert = torch.arange(8).float().reshape(1, 2, 4)
+    selected = expert + 10
+    records = renderer(
+        expert, selected, [{'env_index': 2, 'env_step': 5, 'replan_index': 1}]
+    )
+    np.testing.assert_array_equal(
+        calls[0][0]['expert'], np.arange(8).reshape(4, 2) * 2 + 3
+    )
+    np.testing.assert_array_equal(
+        calls[0][0]['selected'], (np.arange(8).reshape(4, 2) + 10) * 2 + 3
+    )
+    assert records[0]['env_index'] == 2
+    assert records[0]['env_step'] == 5
+    assert records[0]['replan_index'] == 1
+    assert records[0]['video'] == 'comparisons/comparison_000/env_0.mp4'
+    assert renderer(expert, selected, [{'env_index': 0}]) == []
+    assert len(calls) == 1

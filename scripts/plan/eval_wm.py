@@ -212,6 +212,9 @@ def run(cfg: DictConfig):
         results_path = results_path / 'evals' / cfg.subdir
 
     eval_kwargs = evaluation_kwargs(cfg, dataset)
+    if eval_kwargs.get('episodes') == world.num_envs:
+        # Each env runs once; avoid generating expert goals for unused resets.
+        eval_kwargs['reset_mode'] = 'wait'
 
     world.set_policy(policy)
 

@@ -4,7 +4,7 @@ defaults:
   - override data: state
   - override model/encoder: mlp
 
-output_model_name: state_lewm
+output_model_name: lewm_state
 subdir: ${output_model_name}_${now:%Y-%m-%d_%H-%M-%S}
 num_workers: 4
 img_size: 128
@@ -13,7 +13,7 @@ state_dim: ${data.state_dim}
 embed_dim: 192
 
 model:
-  _target_: stable_worldmodel.wm.lewm.StateLeWM
+  _target_: stable_worldmodel.wm.lewm.LeWMState
   state_columns: ${state_columns}
   encoder:
     input_dim: ${state_dim}

@@ -36,6 +36,11 @@ class FakeScene(gym.Env):
         )
         self.steps = 0
 
+    @property
+    def agent(self):
+        pose = SimpleNamespace(p=torch.tensor([[0.0, 0.0, self.steps * 0.1]]))
+        return SimpleNamespace(tcp=SimpleNamespace(pose=pose))
+
     def get_obs(self):
         value = 99 if self.tee.pose.p[0, 0] > 0 else self.steps
         return {
@@ -381,5 +386,262 @@ def test_current_state_expert_query_rejects_unmatched_replay():
     assert env.env.steps == 0
 
 
+class RetryScene(FakeScene):
+    """A seed controls native success and physical start-goal displacement."""
+
+    def __init__(self, settings, retries=()):
+        super().__init__()
+        self.settings = dict(settings)
+        self.retry_settings = iter(retries)
+        self.seed = next(iter(settings))
+        self.reset_calls = []
+
+    @property
+    def agent(self):
+        eef_step = self.settings[self.seed][2]
+        pose = SimpleNamespace(
+            p=torch.tensor([[self.steps * eef_step, 0.0, 0.1]])
+        )
+        return SimpleNamespace(tcp=SimpleNamespace(pose=pose))
+
+    def get_obs(self):
+        object_step = self.settings[self.seed][1]
+        pose = self.tee.pose.raw_pose.clone()
+        pose[:, 0] = self.steps * object_step
+        self.tee.set_pose(Pose.create(pose))
+        obs = super().get_obs()
+        obs['agent']['qpos'] = torch.full((1, 2), float(self.steps))
+        return obs
+
+    def get_state(self):
+        return torch.tensor([[float(self.seed), float(self.steps)]])
+
+    def reset(self, *, seed, options):
+        self.seed = seed
+        if seed not in self.settings:
+            self.settings[seed] = next(self.retry_settings)
+        self.reset_calls.append((seed, dict(options)))
+        return super().reset()
+
+    def step(self, action):
+        self.steps += 1
+        done = self.steps == 2
+        success = done and self.settings[self.seed][0]
+        return (
+            self.get_obs(),
+            torch.tensor([0.0]),
+            torch.tensor([success]),
+            torch.tensor([done and not success]),
+            {'success': torch.tensor([success])},
+        )
+
+
+def retry_env(scene, **kwargs):
+    with patch(
+        'stable_worldmodel.envs.maniskill.pusht.gym.make', return_value=scene
+    ):
+        env = PushTSWMEnv(image_size=8, goal_step_distance=1, **kwargs)
+    env._expert = SimpleNamespace(
+        get_action=lambda *args, **kwargs: torch.zeros(1, 2)
+    )
+    env.state_goal = True
+    return env
+
+
+@pytest.mark.parametrize('beginning', [True, False])
+def test_expert_retries_failure_and_static_pair_with_reproducible_seed(
+    tmp_path, beginning
+):
+    scene = RetryScene(
+        {10: (False, 0.04, 0.05)},
+        retries=[(True, 0.001, 0.001), (True, 0.03, 0.04)],
+    )
+    env = retry_env(scene, expert_max_attempts=3, expert_output_dir=tmp_path)
+    options = {'start_from_beginning': beginning, 'custom_option': 7}
+    obs, info = env.reset(seed=10, options=options)
+    assert info['expert_rollout_attempts'] == 3
+    assert info['expert_task_success']
+    assert info['expert_requested_seed'] == 10
+    accepted_seed = info['expert_seed']
+    assert accepted_seed == env._evaluation_seed == scene.seed
+    attempted_seeds = [seed for seed, _ in scene.reset_calls[:3]]
+    assert len(set(attempted_seeds)) == 3
+    assert attempted_seeds[0] == 10
+    assert attempted_seeds[1] != 11
+    assert accepted_seed not in {10, 11, 12}
+    assert info['expert_start_goal_object_distance_m'] == pytest.approx(0.03)
+    assert info['expert_start_goal_eef_distance_m'] == pytest.approx(0.04)
+    start = info['expert_start_step']
+    assert scene.steps == start == len(env._executed_actions)
+    np.testing.assert_array_equal(obs['obs_agent_qpos'], [start, start])
+    np.testing.assert_array_equal(
+        info['goal_obs_agent_qpos'], [start + 1, start + 1]
+    )
+    assert env.expert_goal_index == 1
+    assert env.replay_report['passed']
+    assert all(
+        options == {'custom_option': 7} for _, options in scene.reset_calls
+    )
+    with np.load(tmp_path / f'expert_seed_{accepted_seed}.npz') as saved:
+        assert saved['rollout_attempts'] == 3
+        assert saved['requested_seed'] == 10
+        assert saved['seed'] == accepted_seed
+        assert saved['eef_position'].shape == (3, 3)
+    assert not (tmp_path / 'expert_seed_10.npz').exists()
+    _, repeated = env.reset(seed=10, options=options)
+    assert repeated['expert_seed'] == accepted_seed
+    assert repeated['expert_start_step'] == start
+
+
+@pytest.mark.parametrize('beginning', [True, False])
+def test_retry_seed_does_not_overlap_adjacent_evaluation_reset(beginning):
+    scene = RetryScene(
+        {10: (False, 0.04, 0.05), 11: (True, 0.03, 0.04)},
+        retries=[(True, 0.03, 0.04)],
+    )
+    env = retry_env(scene, expert_max_attempts=2)
+    options = {'start_from_beginning': beginning}
+    _, first = env.reset(seed=10, options=options)
+    _, second = env.reset(seed=11, options=options)
+    assert first['expert_rollout_attempts'] == 2
+    assert second['expert_rollout_attempts'] == 1
+    assert first['expert_seed'] != second['expert_seed'] == 11
+
+
+def test_retry_seed_generation_skips_previously_attempted_seeds():
+    scene = RetryScene(
+        {10: (False, 0.04, 0.05)},
+        retries=[(False, 0.04, 0.05), (True, 0.03, 0.04)],
+    )
+    env = retry_env(scene, expert_max_attempts=3)
+    # The retry RNG first repeats the original seed, then a previous retry.
+    rng = SimpleNamespace(integers=lambda *args: next(draws))
+    draws = iter([10, 1000, 1000, 2000])
+    with patch(
+        'stable_worldmodel.envs.maniskill.pusht.np.random.default_rng',
+        return_value=rng,
+    ):
+        _, info = env.reset(seed=10)
+    assert [seed for seed, _ in scene.reset_calls[:3]] == [10, 1000, 2000]
+    assert info['expert_seed'] == 2000
+
+
+@pytest.mark.parametrize(
+    'object_step,eef_step',
+    [
+        (0.001, 0.03),
+        (0.03, 0.001),
+        (0.03, 0.03),
+        (0.03125, 0.03125),
+    ],
+)
+def test_expert_accepts_pair_unless_both_displacements_are_below_threshold(
+    object_step, eef_step
+):
+    scene = RetryScene({10: (True, object_step, eef_step)})
+    # Use an exactly representable threshold for the equality case.
+    threshold = 0.03125 if object_step == eef_step == 0.03125 else 0.02
+    env = retry_env(
+        scene,
+        expert_max_attempts=1,
+        expert_min_object_displacement=threshold,
+        expert_min_eef_displacement=threshold,
+    )
+    _, info = env.reset(seed=10)
+    assert info['expert_rollout_attempts'] == 1
+    assert info['expert_seed'] == 10
+
+
+@pytest.mark.parametrize(
+    'success,object_step,eef_step,reason',
+    [
+        (False, 0.03, 0.04, 'did not solve'),
+        (True, 0.001, 0.001, 'movement too small'),
+    ],
+)
+def test_expert_retries_stop_at_attempt_limit(
+    success, object_step, eef_step, reason
+):
+    scene = RetryScene(
+        {10: (success, object_step, eef_step)},
+        retries=[(success, object_step, eef_step)],
+    )
+    env = retry_env(scene, expert_max_attempts=2)
+    with pytest.raises(RuntimeError, match=f'after 2 attempts.*{reason}'):
+        env.reset(seed=10)
+    attempted = [seed for seed, _ in scene.reset_calls]
+    assert len(attempted) == len(set(attempted)) == 2
+    assert attempted[0] == 10
+    assert attempted[1] != 11
+
+
+@pytest.mark.parametrize(
+    'settings',
+    [
+        {'expert_max_attempts': 0},
+        {'expert_max_attempts': 1.5},
+        {'expert_max_attempts': True},
+        {'expert_min_object_displacement': -0.01},
+        {'expert_min_object_displacement': float('nan')},
+        {'expert_min_eef_displacement': float('inf')},
+    ],
+)
+def test_expert_retry_settings_are_validated_before_simulator_creation(
+    settings,
+):
+    with patch('stable_worldmodel.envs.maniskill.pusht.gym.make') as make:
+        with pytest.raises(ValueError):
+            PushTSWMEnv(**settings)
+        make.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_comparison_replays_both_sequences_without_advancing_live_scene(
+    tmp_path, monkeypatch
+):
+    live = FakeScene()
+    oracle = FakeScene()
+    live.steps = 2
+    env = PushTSWMEnv.__new__(PushTSWMEnv)
+    env.env = live
+    env.camera_name = 'base_camera'
+    env.image_size = 8
+    env.action_space = live.single_action_space
+    env._planning_oracle = oracle
+    env._evaluation_seed = 42
+    env._evaluation_options = {}
+    env._executed_actions = [np.zeros(2), np.zeros(2)]
+    env._goal = np.full((8, 8, 3), 77, dtype=np.uint8)
+    env._goal_pose = live.tee.pose.raw_pose.clone()
+    env.goal_position_tolerance = 0.02
+    env.goal_yaw_tolerance = 0.15
+    env.goal_eef_position_tolerance = None
+    captured = []
+
+    def save(output, panels, fps):
+        output.mkdir(parents=True)
+        captured.append(panels)
+
+    monkeypatch.setattr('stable_worldmodel.plot.save_panel_videos', save)
+    results = env.planning_action_comparison(
+        {
+            'expert': np.zeros((3, 2)),
+            'selected': np.ones((3, 2)),
+        },
+        tmp_path / 'comparison',
+    )
+    assert live.steps == 2
+    assert len(env._executed_actions) == 2
+    panels = captured[0]
+    assert set(panels) == {'expert', 'selected', 'goal'}
+    for name in ('expert', 'selected'):
+        assert panels[name][0].shape == (4, 8, 8, 3)
+        assert (panels[name][0][0] == 2).all()
+        assert (panels[name][0][-1] == 5).all()
+        assert results[name]['final_goal_success']
+    with np.load(tmp_path / 'comparison' / 'actions.npz') as saved:
+        np.testing.assert_array_equal(saved['expert'], np.zeros((3, 2)))
+        np.testing.assert_array_equal(saved['selected'], np.ones((3, 2)))

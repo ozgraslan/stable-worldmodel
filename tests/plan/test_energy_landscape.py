@@ -1,4 +1,4 @@
-"""Check XY orientation, endpoint scoring, and executed block alignment."""
+"""Expert pair sampling, normalization-only data, and action-grid contracts."""
 
 import json
 from types import SimpleNamespace
@@ -35,8 +35,12 @@ class LinearDynamics(LeWM):
         info['emb'] = self.observation(info)
         return info
 
-    def predict(self, emb, act_emb):
-        return emb + act_emb.reshape(*act_emb.shape[:-1], -1, 2).sum(-2)
+    def predict(self, info):
+        act_emb = info['act_emb']
+        info['preds'] = info['emb'] + act_emb.reshape(
+            *act_emb.shape[:-1], -1, 2
+        ).sum(-2)
+        return info
 
 
 def test_chunking_and_minimum():
@@ -69,43 +73,91 @@ def test_endpoint_energy(metric):
     assert torch.isfinite(normalized).all()
 
 
-class Dataset:
-    column_names = ('action', 'obs', 'pixels')
-    _schema_names = ('episode_idx', 'step_idx')
+class StatsOnly:
+    """Statistics source that rejects every attempt to read trajectory rows."""
 
     def __init__(self):
         self.data = {
-            'episode_idx': np.array([7] * 12 + [8] * 12),
-            'step_idx': np.tile(np.arange(12), 2),
-            'action': np.arange(48, dtype=np.float32).reshape(24, 2) / 100,
-            'obs': np.arange(48, dtype=np.float32).reshape(24, 2),
-            'pixels': np.zeros((24, 8, 8, 3), dtype=np.uint8),
+            'action': np.array([[-1, -1], [1, 1]], dtype=np.float32),
+            'obs': np.array([[-1, -1], [1, 1]], dtype=np.float32),
         }
 
     def get_col_data(self, key):
         return self.data[key]
 
-    def get_dim(self, key):
-        return self.data[key].shape[-1]
-
     def get_row_data(self, rows):
-        return {k: v[rows] for k, v in self.data.items()}
+        pytest.fail('Start and goal must never be read from dataset rows')
+
+
+class ExpertEnvironment:
+    """Successful expert case restored to a nonzero trajectory start."""
+
+    def __init__(self, *, success=True, goal_index=4):
+        self.closed = False
+        self.success = success
+        self.expert_goal_index = goal_index
+        self.reset_calls = []
+        self.comparisons = []
+        self.expert_actions = np.array(
+            [
+                [0.1, 0.2],
+                [0.3, -0.2],
+                [-0.4, 0.1],
+                [0.2, 0.3],
+                [0.8, -0.9],
+                [-0.7, 0.6],
+            ],
+            dtype=np.float32,
+        )
+        self.expert_frames = np.stack(
+            [
+                np.full((8, 8, 3), 30 + 7 * step, dtype=np.uint8)
+                for step in range(len(self.expert_actions) + 1)
+            ]
+        )
+        self.start = np.array([0.4, -0.2], dtype=np.float32)
+        self.goal_observation = {
+            'obs': self.start + self.expert_actions[:goal_index].sum(0) * 0.1
+        }
+
+    def reset(self, *, seed, options):
+        self.reset_calls.append((seed, options))
+        return {'obs': self.start.copy()}, {
+            'goal': self.expert_frames[self.expert_goal_index],
+            'expert_start_step': 7,
+            'expert_seed': 123,
+            'expert_task_success': self.success,
+            'expert_rollout_attempts': 2,
+            'goal_step_distance': self.expert_goal_index,
+        }
+
+    def planning_action_comparison(self, sequences, output):
+        self.comparisons.append((sequences, output))
+        return {label: {'final_goal_success': True} for label in sequences}
+
+    def close(self):
+        self.closed = True
 
 
 def config(tmp_path):
     return OmegaConf.create(
         {
             'seed': 42,
-            'goal_source': 'dataset',
-            'episode': 7,
-            'start_step': 4,
-            'history_len': 1,
+            'expert_checkpoint': 'unused-expert.pt',
+            'expert_policy_type': 'rgb',
+            'expert_encoder': 'spatial_softmax',
+            'expert_max_steps': 100,
+            'expert_max_attempts': 20,
+            'expert_min_object_displacement': 0.02,
+            'expert_min_eef_displacement': 0.02,
+            'start_from_beginning': False,
+            'use_expert_action_mean': False,
+            'sim_backend': 'physx_cpu',
             'action_block': 2,
             'horizon': 2,
             'img_size': 8,
             'policy': 'unused',
-            'dataset_name': 'unused',
-            'stats_dataset': None,
+            'dataset_name': 'normalization-only',
             'cache_dir': None,
             'device': 'cpu',
             'normalize_reps': False,
@@ -113,99 +165,214 @@ def config(tmp_path):
             'grid_size': 0.075,
             'controller_scale': 0.1,
             'goal_offset_steps': 4,
-            'play_in_reverse': False,
             'pose_column': 'obs',
-            'plan_config': {
-                'horizon': 2,
-                'receding_horizon': 1,
-                'action_block': 2,
-                'history_len': 1,
-            },
-            'solver': {
-                '_target_': 'stable_worldmodel.planning.solver.CEMSolver',
-                'num_samples': 25,
-                'n_steps': 2,
-                'topk': 10,
-                'var_scale': 1.0,
-                'device': 'cpu',
-                'seed': 42,
-            },
             'chunk_size': 2,
             'output_dir': str(tmp_path),
         }
     )
 
 
-def test_window_and_action_packing(tmp_path):
-    ds = Dataset()
-    cfg = config(tmp_path)
-    info, _scaler, _, delta = evaluation.prepare_case(
-        ds, ds, LinearDynamics(), cfg
-    )
-    assert info['action_history'].shape == (1, 0, 4)
-    assert info['obs'].shape == (1, 1, 2)
-    np.testing.assert_allclose(delta, ds.data['obs'][6] - ds.data['obs'][4])
-    with pytest.raises(ValueError, match='contiguous'):
-        evaluation.trajectory_rows(ds, 7, 10, 3, 2, 2)
-    with pytest.raises(ValueError, match='contiguous'):
-        evaluation.trajectory_rows(ds, 7, 0, 3, 2, 1)
+def mock_inputs(monkeypatch, model, stats=None, env=None):
+    stats = StatsOnly() if stats is None else stats
+    env = ExpertEnvironment() if env is None else env
+    loads = []
+
+    def load_stats(name, **kwargs):
+        assert name == 'normalization-only'
+        assert 'pixels' not in kwargs['keys_to_load']
+        loads.append(kwargs)
+        return stats
+
+    monkeypatch.setattr(evaluation.swm.data, 'load_dataset', load_stats)
+    monkeypatch.setattr(evaluation, 'make_goal_environment', lambda cfg: env)
+    if model is not None:
+        monkeypatch.setattr(
+            evaluation, 'load_pretrained', lambda *a, **kw: model
+        )
+    return env, stats, loads
 
 
 @pytest.mark.parametrize('state', [True, False])
-def test_complete_evaluation(tmp_path, monkeypatch, state):
-    ds = Dataset()
+@pytest.mark.parametrize('expert_mean', [False, True])
+def test_complete_expert_evaluation(tmp_path, monkeypatch, state, expert_mean):
     model = LinearDynamics(state)
-    monkeypatch.setattr(evaluation, 'load_pretrained', lambda *a, **kw: model)
-    monkeypatch.setattr(
-        evaluation.swm.data, 'load_dataset', lambda *a, **kw: ds
+    env, _stats, loads = mock_inputs(monkeypatch, model)
+    cfg = config(tmp_path)
+    cfg.use_expert_action_mean = expert_mean
+    result = evaluation.evaluate(cfg)
+    assert env.closed
+    assert env.reset_calls == [(42, {'start_from_beginning': False})]
+    assert len(loads) == 1
+    assert loads[0]['keys_to_load'] == (
+        ['action', 'obs'] if state else ['action']
     )
-    result = evaluation.evaluate(config(tmp_path))
-    assert (tmp_path / 'landscape.png').stat().st_size > 0
-    assert (tmp_path / 'landscape_3d.png').stat().st_size > 0
-    assert (tmp_path / 'landscape.pdf').stat().st_size > 0
-    assert (tmp_path / 'landscape_3d.pdf').stat().st_size > 0
-    if not state:
-        assert (tmp_path / 'trajectory.png').stat().st_size > 0
-    data = np.load(tmp_path / 'landscape.npz')
-    assert data['energy'].shape == (3, 3)
-    assert data['model_action_sequences'].shape == (9, 2, 4)
-    assert data['cem_model_action_sequence'].shape == (2, 4)
-    raw = data['cem_controller_action_sequence']
-    np.testing.assert_allclose(data['cem_delta_sequence'], raw.sum(1) * 0.1)
-    assert np.isfinite(data['energy']).all()
-    expected_raw = ds.data['action'][4:8].reshape(2, 2, 2)
-    np.testing.assert_allclose(
-        data['ground_truth_controller_action_sequence'], expected_raw
-    )
-    np.testing.assert_allclose(
-        data['ground_truth_action_total_delta'], expected_raw.sum((0, 1)) * 0.1
-    )
-    center = expected_raw.sum((0, 1)) * 0.1
-    np.testing.assert_allclose(data['axis'].mean(1), center, atol=1e-7)
-    np.testing.assert_allclose(data['axis'][:, 1], center, atol=1e-7)
-    np.testing.assert_allclose(data['total_deltas'][4], center, atol=1e-7)
-    np.testing.assert_allclose(result['grid_center_total_delta'], center)
-    assert result['grid_center_source'] == 'recorded_action'
-    np.testing.assert_allclose(
-        data['axis'][:, -1] - data['axis'][:, 0], [0.3, 0.3]
-    )
-    from stable_worldmodel.data.normalization import get_scaler
-
-    action_scaler = get_scaler('zscore').fit(ds.data['action'])
-    expected_packed = action_scaler.transform(expected_raw).reshape(2, 4)
-    np.testing.assert_allclose(
-        data['ground_truth_model_action_sequence'], expected_packed
-    )
-    expected_gap = (
-        result['ground_truth_action_energy'] - result['best_grid_energy']
-    )
-    assert result['ground_truth_action_minus_grid_min'] == pytest.approx(
-        expected_gap
-    )
-    assert result['grid_actions_with_lower_energy'] == int(
-        (data['energy'] < result['ground_truth_action_energy'] - 1e-6).sum()
-    )
+    for filename in (
+        'landscape.png',
+        'landscape.pdf',
+        'landscape_3d.png',
+        'landscape_3d.pdf',
+        'trajectory.png',
+        'start.png',
+        'goal.png',
+    ):
+        assert (tmp_path / filename).stat().st_size > 0
     assert json.loads((tmp_path / 'results.json').read_text()) == result
+    assert result['goal_source'] == 'expert'
+    assert result['context_step'] == 7
+    assert result['goal_step'] == 11
+    assert result['expert']['expert_seed'] == 123
+    assert result['reference_action_label'] == 'Expert actions'
+    assert result['comparison_video'] == 'best_action/env_0.mp4'
+    assert set(result['comparison_results']) == {
+        'Grid minimum',
+        'Expert actions',
+    }
+    assert not any(key.startswith('cem_') for key in result)
+
+    with np.load(tmp_path / 'landscape.npz') as data:
+        assert not any(key.startswith('cem_') for key in data.files)
+        raw = env.expert_actions[:4].reshape(2, 2, 2)
+        np.testing.assert_array_equal(
+            data['ground_truth_controller_action_sequence'], raw
+        )
+        np.testing.assert_allclose(
+            data['ground_truth_action_total_delta'], raw.sum((0, 1)) * 0.1
+        )
+        np.testing.assert_array_equal(
+            data['clip_frames'], env.expert_frames[[0, 2, 4]]
+        )
+        assert data['model_action_sequences'].shape == (9, 2, 4)
+        assert data['controller_action_sequences'].shape == (9, 2, 2, 2)
+        np.testing.assert_allclose(
+            data['total_deltas'],
+            data['controller_action_sequences'].sum((1, 2)) * 0.1,
+        )
+        assert np.isfinite(data['energy']).all()
+        expected_center = raw if expert_mean else np.zeros_like(raw)
+        np.testing.assert_array_equal(
+            data['controller_action_sequences'][4], expected_center
+        )
+        np.testing.assert_allclose(
+            result['grid_center_total_delta'],
+            expected_center.sum((0, 1)) * 0.1,
+        )
+        if expert_mean:
+            assert result['ground_truth_action_energy'] == pytest.approx(
+                data['energy'].ravel()[4]
+            )
+        best = data['energy'].argmin()
+        sequences = env.comparisons[0][0]
+        assert set(sequences) == {'Grid minimum', 'Expert actions'}
+        np.testing.assert_array_equal(
+            sequences['Expert actions'], env.expert_actions[:4]
+        )
+        sequence = sequences['Grid minimum']
+        np.testing.assert_array_equal(
+            sequence, data['controller_action_sequences'][best].reshape(-1, 2)
+        )
+        assert env.comparisons[0][1] == tmp_path / 'best_action'
+
+
+@pytest.mark.parametrize('state', [True, False])
+def test_expert_endpoints_use_training_normalization(tmp_path, state):
+    cfg = config(tmp_path)
+    stats = StatsOnly()
+    stats.data['action'] = np.array(
+        [[0.1, -0.2], [0.9, 0.4]], dtype=np.float32
+    )
+    stats.data['obs'] = np.array([[0, 0], [2, 4]], dtype=np.float32)
+    env = ExpertEnvironment()
+    info, scaler, preview, pose_delta, raw, _metadata = (
+        evaluation.prepare_expert_case(
+            env,
+            stats,
+            LinearDynamics(state),
+            cfg,
+        )
+    )
+    assert info['action_history'].shape == (1, 0, 4)
+    np.testing.assert_allclose(scaler.mean, [[0.5, 0.1]], atol=1e-7)
+    np.testing.assert_array_equal(raw.flatten(0, 1), env.expert_actions[:4])
+    np.testing.assert_array_equal(preview, env.expert_frames[[0, 2, 4]])
+    np.testing.assert_allclose(
+        pose_delta, env.goal_observation['obs'] - env.start
+    )
+    if state:
+        np.testing.assert_allclose(
+            info['obs'][0, 0], (env.start - [1, 2]) / [1, 2]
+        )
+        np.testing.assert_allclose(
+            info['goal_obs'][0, 0],
+            (env.goal_observation['obs'] - [1, 2]) / [1, 2],
+        )
+    else:
+        mean = torch.tensor([0.485, 0.456, 0.406])
+        std = torch.tensor([0.229, 0.224, 0.225])
+        torch.testing.assert_close(
+            info['pixels'][0, 0, :, 0, 0], (30 / 255 - mean) / std
+        )
+        torch.testing.assert_close(
+            info['goal'][0, 0, :, 0, 0], (58 / 255 - mean) / std
+        )
+
+
+def test_grid_preserves_expert_sequence_at_controller_bounds(tmp_path):
+    from stable_worldmodel.data.normalization import ZScoreScaler
+
+    cfg = config(tmp_path)
+    cfg.use_expert_action_mean = True
+    raw = torch.tensor(
+        [[[1.0, -1.0], [-1.0, 1.0]], [[0.2, -0.3], [-0.4, 0.5]]]
+    )
+    scaler = ZScoreScaler(mean=[[0.2, -0.1]], std=[[0.4, 0.3]])
+    axes, commands, candidates, clipped = evaluation.build_action_grid(
+        cfg, scaler, raw
+    )
+    torch.testing.assert_close(commands[4], raw)
+    assert clipped > 0
+    assert (commands.abs() <= 1).all()
+    recovered = scaler.inverse_transform(candidates.reshape(9, 2, 2, 2))
+    torch.testing.assert_close(recovered, commands)
+    totals = commands.sum((1, 2)) * cfg.controller_scale
+    np.testing.assert_allclose(axes[0], totals[:3, 0])
+    np.testing.assert_allclose(axes[1], totals[::3, 1])
+
+
+@pytest.mark.parametrize(
+    'success,goal_index,message',
+    [
+        (False, 4, 'did not solve'),
+        (True, 3, 'pair spans 3 steps'),
+    ],
+)
+def test_invalid_expert_case_closes_environment(
+    tmp_path, monkeypatch, success, goal_index, message
+):
+    env = ExpertEnvironment(success=success, goal_index=goal_index)
+    mock_inputs(monkeypatch, LinearDynamics(), env=env)
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        evaluation.evaluate(config(tmp_path))
+    assert env.closed
+    assert not env.comparisons
+
+
+def test_expert_pair_requires_matching_offset(tmp_path):
+    cfg = config(tmp_path)
+    cfg.goal_offset_steps = 3
+    env = ExpertEnvironment()
+    with pytest.raises(ValueError, match=r'horizon \* action_block'):
+        evaluation.prepare_expert_case(env, StatsOnly(), LinearDynamics(), cfg)
+    assert not env.reset_calls
+
+
+@pytest.mark.parametrize('invalid', [float('nan'), 2.0])
+def test_invalid_expert_actions_are_rejected(tmp_path, invalid):
+    env = ExpertEnvironment()
+    env.expert_actions[0, 0] = invalid
+    with pytest.raises(ValueError, match='finite|bounds'):
+        evaluation.prepare_expert_case(
+            env, StatsOnly(), LinearDynamics(), config(tmp_path)
+        )
 
 
 def test_native_state_checkpoint(tmp_path, monkeypatch):
@@ -216,7 +383,7 @@ def test_native_state_checkpoint(tmp_path, monkeypatch):
 
     torch.manual_seed(0)
     model_config = {
-        '_target_': 'stable_worldmodel.wm.lewm.StateLeWM',
+        '_target_': 'stable_worldmodel.wm.lewm.LeWMState',
         'state_columns': ['obs'],
         'encoder': {
             '_target_': 'torch.nn.Linear',
@@ -248,76 +415,12 @@ def test_native_state_checkpoint(tmp_path, monkeypatch):
     cfg.normalize_reps = True
     cfg.policy = str(tmp_path / 'checkpoints/native/weights.pt')
     cfg.cache_dir = str(tmp_path)
-    ds = Dataset()
-    monkeypatch.setattr(
-        evaluation.swm.data, 'load_dataset', lambda *a, **kw: ds
-    )
+    stats = StatsOnly()
+    mock_inputs(monkeypatch, model=None, stats=stats)
     result = evaluation.evaluate(cfg)
-    assert np.isfinite(result['cem_energy'])
+    assert np.isfinite(result['ground_truth_action_energy'])
     saved = np.load(tmp_path / 'result/landscape.npz')
     assert np.ptp(saved['energy']) > 0
-
-
-@pytest.mark.parametrize('representation', ['jpeg', 'objects', 'dense'])
-def test_rgb_row_representations(tmp_path, representation):
-    import io
-
-    from PIL import Image
-
-    ds = Dataset()
-    frames = np.full((24, 8, 8, 3), 128, dtype=np.uint8)
-    if representation == 'jpeg':
-        blobs = []
-        for frame in frames:
-            buffer = io.BytesIO()
-            Image.fromarray(frame).save(buffer, format='JPEG')
-            blobs.append(buffer.getvalue())
-        ds.data['pixels'] = np.asarray(blobs, dtype=object)
-    elif representation == 'objects':
-        objects = np.empty(24, dtype=object)
-        objects[:] = list(frames)
-        ds.data['pixels'] = objects
-    else:
-        ds.data['pixels'] = frames
-    info, _, preview, _ = evaluation.prepare_case(
-        ds, ds, LinearDynamics(state=False), config(tmp_path)
-    )
-    assert preview.dtype == np.uint8
-    assert preview.shape == (3, 8, 8, 3)
-    assert np.all(preview == 128)
-    expected = (
-        128 / 255 - torch.tensor([0.485, 0.456, 0.406])
-    ) / torch.tensor([0.229, 0.224, 0.225])
-    torch.testing.assert_close(info['pixels'][0, 0, :, 0, 0], expected)
-    torch.testing.assert_close(info['goal'][0, 0, :, 0, 0], expected)
-
-
-def test_rgb_lance_rows(tmp_path, monkeypatch):
-    pytest.importorskip('lancedb')
-    from stable_worldmodel.data.formats.lance import LanceWriter
-
-    ds = Dataset()
-    ds.data['pixels'][:] = 128
-    path = tmp_path / 'rgb.lance'
-    with LanceWriter(path) as writer:
-        writer.write_episodes(
-            [
-                {
-                    key: list(ds.data[key][:12])
-                    for key in ('action', 'pixels', 'obs')
-                }
-            ]
-        )
-    cfg = config(tmp_path / 'result')
-    cfg.episode = 0
-    cfg.dataset_name = str(path)
-    cfg.cache_dir = str(tmp_path)
-    monkeypatch.setattr(
-        evaluation, 'load_pretrained', lambda *a, **kw: LinearDynamics(False)
-    )
-    result = evaluation.evaluate(cfg)
-    assert np.isfinite(result['cem_energy'])
-    assert (tmp_path / 'result/landscape.png').stat().st_size > 0
 
 
 @pytest.mark.parametrize('normalize', [True, False])
@@ -374,21 +477,6 @@ def test_delta_chunk_conservation():
     torch.testing.assert_close(raw[:, :, 0], raw[:, :, -1])
 
 
-def test_reverse_pose_reference(tmp_path):
-    ds = Dataset()
-    cfg = config(tmp_path)
-    forward, _, _, delta = evaluation.prepare_case(
-        ds, ds, LinearDynamics(), cfg
-    )
-    cfg.play_in_reverse = True
-    backward, _, _, reverse_delta = evaluation.prepare_case(
-        ds, ds, LinearDynamics(), cfg
-    )
-    torch.testing.assert_close(backward['obs'], forward['goal_obs'])
-    torch.testing.assert_close(backward['goal_obs'], forward['obs'])
-    np.testing.assert_allclose(reverse_delta, -delta)
-
-
 def test_replot_preserves_values_without_model(tmp_path, monkeypatch):
     axis = np.linspace(-0.075, 0.075, 5)
     energy = np.arange(25, dtype=np.float32).reshape(5, 5) / 25
@@ -431,7 +519,7 @@ def test_replot_preserves_values_without_model(tmp_path, monkeypatch):
     assert source.read_bytes() == original
 
 
-def test_shared_cem_defaults():
+def test_expert_config_defaults():
     from pathlib import Path
 
     import hydra
@@ -442,240 +530,37 @@ def test_shared_cem_defaults():
     ):
         cfg = hydra.compose(config_name='energy_landscape_overhead')
         native = hydra.compose(config_name='maniskill_overhead')
-    for key in ('_target_', 'num_samples', 'n_steps', 'topk', 'var_scale'):
-        assert cfg.solver[key] == native.solver[key]
-    assert cfg.plan_config.horizon == native.plan_config.horizon
-    assert cfg.plan_config.action_block == native.plan_config.action_block
-    assert cfg.samples == 41
-    assert cfg.goal_source == 'simulator'
-    assert cfg.goal_action_index is None
-    assert cfg.goal_offset_steps == 5
+    assert cfg.expert_policy_type == native.world.expert_policy_type
+    assert cfg.expert_max_attempts == native.world.expert_max_attempts
+    assert not cfg.start_from_beginning
+    assert not cfg.use_expert_action_mean
+    assert 'solver' not in cfg
+    assert 'plan_config' not in cfg
+    assert 'goal_source' not in cfg
+    assert 'goal_action_index' not in cfg
     cfg.horizon = 3
     assert cfg.goal_offset_steps == 15
-    cfg.action_block = 2
-    assert cfg.goal_offset_steps == 6
-    assert 'cem' not in cfg
 
 
-def test_cem_matches_native_solver(tmp_path):
-    import hydra
-    from gymnasium.spaces import Box
-
-    from stable_worldmodel.data.normalization import ZScoreScaler
-    from stable_worldmodel.planning import ShootingCostEvaluator
-    from stable_worldmodel.policy import PlanConfig
+def test_expert_environment_uses_shared_adapter(tmp_path, monkeypatch):
+    pytest.importorskip('mani_skill')
+    from stable_worldmodel.envs.maniskill import pusht
 
     cfg = config(tmp_path)
-    model = LinearDynamics()
-    info = {
-        'obs': torch.tensor([[[0.1, 0.3]]]),
-        'goal_obs': torch.tensor([[[0.8, -0.5]]]),
-    }
-    scaler = ZScoreScaler(mean=[[0.2, -0.1]], std=[[0.4, 0.3]])
-    objective = EndpointEnergy()
-    actual, raw, delta, _ = evaluation.plan_with_cem(
-        model, info, scaler, cfg, objective
-    )
-    solver = hydra.utils.instantiate(
-        cfg.solver, cost=ShootingCostEvaluator(model, objective)
-    )
-    solver.configure(
-        action_space=Box(-1.0, 1.0, shape=(1, 2)),
-        n_envs=1,
-        config=PlanConfig(**OmegaConf.to_container(cfg.plan_config)),
-    )
-    expected = solver.solve(info)['actions'][0]
-    torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(
-        raw, scaler.inverse_transform(expected.reshape(2, 2, 2))
-    )
-    torch.testing.assert_close(delta, raw.sum(1) * cfg.controller_scale)
+    env = ExpertEnvironment()
+    settings = {}
 
-
-def test_recorded_actions_reverse_and_episode_boundary(tmp_path):
-    from stable_worldmodel.data.normalization import ZScoreScaler
-
-    ds = Dataset()
-    cfg = config(tmp_path)
-    cfg.play_in_reverse = True
-    assert evaluation.recorded_action_sequence(ds, ZScoreScaler(), cfg) == (
-        None,
-        None,
-    )
-    cfg.play_in_reverse = False
-    cfg.start_step = 10
-    with pytest.raises(ValueError, match='contiguous'):
-        evaluation.recorded_action_sequence(ds, ZScoreScaler(), cfg)
-
-
-def test_recorded_action_energy_against_goal(tmp_path):
-    from stable_worldmodel.data.normalization import get_scaler
-
-    ds = Dataset()
-    cfg = config(tmp_path)
-    model = LinearDynamics()
-    info, action_scaler, _, _ = evaluation.prepare_case(ds, ds, model, cfg)
-    actions, _ = evaluation.recorded_action_sequence(ds, action_scaler, cfg)
-    actual = evaluate_action_sequences(model, info, actions.unsqueeze(0))[
-        0
-    ].item()
-    state_scaler = get_scaler('zscore').fit(ds.data['obs'])
-    start, goal = state_scaler.transform(ds.data['obs'][[4, 8]])
-    increments = action_scaler.transform(ds.data['action'][4:8]).sum(0)
-    expected = np.abs(start + increments - goal).mean()
-    assert actual == pytest.approx(expected)
-
-
-class GoalSimulator:
-    """Deterministic simulator double with observable action execution."""
-
-    def __init__(self, truncate=False):
-        self.actions = []
-        self.closed = False
-        self.truncate = truncate
-
-    def reset(self, *, seed):
-        self.seed = seed
-        self.position = np.array([0.4, -0.2], dtype=np.float32)
-        return {'obs': self.position.copy()}, {}
-
-    def step(self, action):
-        self.actions.append(action.copy())
-        self.position += action * 0.1
-        return {'obs': self.position.copy()}, 0, False, self.truncate, {}
-
-    def render(self):
-        return np.full((8, 8, 3), 30 + len(self.actions), dtype=np.uint8)
-
-    def close(self):
-        self.closed = True
-
-
-@pytest.mark.parametrize('state', [True, False])
-def test_simulator_goal_is_selected_grid_endpoint(
-    tmp_path, monkeypatch, state
-):
-    ds = Dataset()
-    model = LinearDynamics(state)
-    env = GoalSimulator()
-    cfg = config(tmp_path)
-    cfg.goal_source = 'simulator'
-    cfg.goal_action_index = 7
-    monkeypatch.setattr(evaluation, 'make_goal_environment', lambda cfg: env)
-    monkeypatch.setattr(evaluation, 'load_pretrained', lambda *a, **kw: model)
-    monkeypatch.setattr(
-        evaluation.swm.data, 'load_dataset', lambda *a, **kw: ds
-    )
-
-    def no_expert_rows(*args, **kwargs):
-        pytest.fail('Simulator goals must not read expert trajectory rows')
-
-    monkeypatch.setattr(ds, 'get_row_data', no_expert_rows)
-    result = evaluation.evaluate(cfg)
-    assert env.closed
-    assert env.seed == cfg.seed
-    assert len(env.actions) == cfg.horizon * cfg.action_block
-    expected_command = np.array([0, 0.375], dtype=np.float32)
-    np.testing.assert_allclose(env.actions, np.tile(expected_command, (4, 1)))
-    data = np.load(tmp_path / 'landscape.npz')
-    np.testing.assert_allclose(
-        data['ground_truth_model_action_sequence'],
-        data['model_action_sequences'][7],
-    )
-    np.testing.assert_allclose(
-        data['ground_truth_action_total_delta'], data['total_deltas'][7]
-    )
-    assert result['ground_truth_action_energy'] == pytest.approx(
-        data['energy'].ravel()[7], abs=1e-6
-    )
-    assert result['goal_source'] == 'simulator'
-    assert result['goal_action_index'] == 7
-    assert result['reference_action_label'] == 'Executed grid action'
-    assert result['context_step'] == 0
-    assert result['goal_step'] == 4
-    assert data['clip_frames'][-1, 0, 0, 0] == 34
-    assert (tmp_path / 'goal.png').is_file()
-    assert (tmp_path / 'start.png').is_file()
-
-
-@pytest.mark.parametrize('state', [True, False])
-def test_simulator_goal_preprocessing(tmp_path, monkeypatch, state):
-    ds, model = Dataset(), LinearDynamics(state)
-    cfg = config(tmp_path)
-    cfg.goal_action_index = 7
-    env = GoalSimulator()
-    monkeypatch.setattr(evaluation, 'make_goal_environment', lambda cfg: env)
-    _, grid = xy_action_grid(3, -0.075, 0.075)
-    info, _, _, _, _, _, _ = evaluation.prepare_simulator_case(
-        ds, model, cfg, grid
-    )
-    if state:
-        from stable_worldmodel.data.normalization import get_scaler
-
-        scaler = get_scaler('zscore').fit(ds.data['obs'])
-        np.testing.assert_allclose(
-            info['goal_obs'][0, 0],
-            scaler.transform(env.position).reshape(-1),
-            atol=1e-7,
-        )
-        np.testing.assert_allclose(
-            info['obs'][0, 0],
-            scaler.transform(np.array([0.4, -0.2], dtype=np.float32)).reshape(
-                -1
-            ),
-        )
-    else:
-        mean = torch.tensor([0.485, 0.456, 0.406])
-        std = torch.tensor([0.229, 0.224, 0.225])
-        torch.testing.assert_close(
-            info['goal'][0, 0, :, 0, 0], (34 / 255 - mean) / std
-        )
-        torch.testing.assert_close(
-            info['pixels'][0, 0, :, 0, 0], (30 / 255 - mean) / std
-        )
-
-
-def test_simulator_goal_validation_and_cleanup(tmp_path, monkeypatch):
-    cfg = config(tmp_path)
-    ds, model = Dataset(), LinearDynamics()
-    _, grid = xy_action_grid(3, -0.075, 0.075)
-    env = GoalSimulator(truncate=True)
-    monkeypatch.setattr(evaluation, 'make_goal_environment', lambda cfg: env)
-    cfg.goal_action_index = 7
-    with pytest.raises(RuntimeError, match='before the goal horizon'):
-        evaluation.prepare_simulator_case(ds, model, cfg, grid)
-    assert env.closed
-    cfg.goal_action_index = 9
-    with pytest.raises(ValueError, match='must index'):
-        evaluation.prepare_simulator_case(ds, model, cfg, grid)
-    cfg.play_in_reverse = True
-    with pytest.raises(ValueError, match='forward playback'):
-        evaluation.prepare_simulator_case(ds, model, cfg, grid)
-
-
-def test_simulator_goal_seeded_selection(tmp_path, monkeypatch):
-    cfg = config(tmp_path)
-    cfg.goal_action_index = None
-    _, grid = xy_action_grid(3, -0.075, 0.075)
-    environments = []
-
-    def make_env(cfg):
-        env = GoalSimulator()
-        environments.append(env)
+    def create(**kwargs):
+        settings.update(kwargs)
         return env
 
-    monkeypatch.setattr(evaluation, 'make_goal_environment', make_env)
-    results = [
-        evaluation.prepare_simulator_case(
-            Dataset(), LinearDynamics(), cfg, grid
-        )
-        for _ in range(2)
-    ]
-    expected = int(np.random.default_rng(cfg.seed).integers(len(grid)))
-    assert results[0][-1] == results[1][-1] == expected
-    np.testing.assert_array_equal(
-        environments[0].actions, environments[1].actions
-    )
-    torch.testing.assert_close(
-        results[0][0]['goal_obs'], results[1][0]['goal_obs']
-    )
+    monkeypatch.setattr(pusht, 'PushTSWMEnv', create)
+    assert evaluation.make_goal_environment(cfg) is env
+    assert settings['env_id'] == 'OverheadPushT-v1'
+    assert settings['control_mode'] == 'pd_ee_delta_xy'
+    assert settings['camera_name'] == 'overhead_camera'
+    assert settings['expert_checkpoint'] == cfg.expert_checkpoint
+    assert settings['expert_policy_type'] == cfg.expert_policy_type
+    assert settings['expert_max_attempts'] == cfg.expert_max_attempts
+    assert settings['goal_step_distance'] == cfg.horizon * cfg.action_block
+    assert settings['state_goal']

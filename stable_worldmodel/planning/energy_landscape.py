@@ -113,11 +113,12 @@ class NotebookDynamics(nn.Module):
             info['emb'] = F.layer_norm(info['emb'], (info['emb'].shape[-1],))
         return info
 
-    def predict(self, emb, act_emb):
-        prediction = self.model.predict(emb, act_emb)
+    def predict(self, info):
+        info = self.model.predict(info)
         if self.normalize:
-            prediction = F.layer_norm(prediction, (prediction.shape[-1],))
-        return prediction
+            prediction = info['preds']
+            info['preds'] = F.layer_norm(prediction, (prediction.shape[-1],))
+        return info
 
     def rollout(self, info, actions):
         from stable_worldmodel.wm.lewm.lewm import LeWM

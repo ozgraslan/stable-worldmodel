@@ -1,42 +1,35 @@
-"""Plot endpoint prediction energy for OverheadPushT state/RGB checkpoints.
+"""Plot endpoint prediction energy for expert OverheadPushT trajectories.
 
 Run from the repository root, for example::
 
     python scripts/plan/eval_energy_landscape.py \
-        --config-name=energy_landscape_state_overhead \
-        policy=/path/to/weights.pt dataset_name=/path/to/overhead.lance
+        policy=/path/to/weights.pt expert_checkpoint=/path/to/expert.pt \
+        dataset_name=/path/to/training.lance use_expert_action_mean=true
 
-For RGB, select ``--config-name=energy_landscape_overhead``. Set
-``STABLEWM_HOME`` for the default output directory. See
-``docs/tutorial/energy_landscape.md`` for settings and output descriptions.
-
-By default, a sampled grid action is executed in ManiSkill to generate the
-goal. Dataset mode remains available; no PPO expert is required.
+The dataset supplies normalization statistics only. Start and goal observations
+are sampled from a successful expert rollout using the eval_wm environment.
+See ``docs/tutorial/energy_landscape.md`` for settings and output descriptions.
 """
 
-import io
 import json
+from contextlib import closing
 from pathlib import Path
 
 import hydra
 import numpy as np
 import torch
-from gymnasium.spaces import Box
 from omegaconf import OmegaConf
 from PIL import Image
 from torchvision.transforms import v2
 
 import stable_worldmodel as swm
 from stable_worldmodel.data.normalization import get_scaler
-from stable_worldmodel.planning import ShootingCostEvaluator
 from stable_worldmodel.planning.energy_landscape import (
     EndpointEnergy,
     NotebookDynamics,
     evaluate_action_sequences,
-    pack_delta_sequences,
     xy_action_grid,
 )
-from stable_worldmodel.policy import PlanConfig
 from stable_worldmodel.wm.utils import load_pretrained
 
 if not OmegaConf.has_resolver('energy_rollout_steps'):
@@ -46,91 +39,17 @@ if not OmegaConf.has_resolver('energy_rollout_steps'):
     )
 
 
-def trajectory_rows(dataset, episode, start, history, block, horizon):
-    """Select an exact, contiguous window without crossing episode boundaries.
-
-    ``start`` is the current observation's step index. Context observations
-    precede it by ``block`` steps; the goal is ``horizon * block`` later.
-    """
-    if min(history, block, horizon) < 1:
-        raise ValueError('history, action_block and horizon must be positive')
-    names = set(dataset.column_names)
-    names.update(getattr(dataset, '_schema_names', ()))
-    ep_key = 'episode_idx' if 'episode_idx' in names else 'ep_idx'
-    episodes = dataset.get_col_data(ep_key).reshape(-1)
-    steps = dataset.get_col_data('step_idx').reshape(-1)
-    rows = np.flatnonzero(episodes == episode)
-    mapping = {}
-    for row in rows:
-        step = int(steps[row])
-        if step in mapping:
-            raise ValueError(f'Duplicate step {step} in episode {episode}')
-        mapping[step] = int(row)
-    first = start - (history - 1) * block
-    last = start + horizon * block
-    if first < 0 or any(s not in mapping for s in range(first, last + 1)):
-        raise ValueError(
-            f'Episode {episode} needs contiguous steps {first}..{last}. '
-            'Choose a later start or a shorter history/horizon.'
-        )
-    return [mapping[s] for s in range(first, last + 1)]
-
-
-def rgb_frames(values):
-    """Convert row-reader images (JPEG bytes or arrays) to uint8 NHWC RGB.
-
-    Lance row reads preserve compressed JPEG blobs in an object array;
-    unlike training windows, they do not decode the images automatically.
-    """
-    frames = []
-    for value in values:
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            with Image.open(io.BytesIO(bytes(value))) as image:
-                frame = np.array(image.convert('RGB'))
-        else:
-            frame = np.asarray(value)
-            if frame.dtype == object:
-                frame = np.asarray(frame.tolist(), dtype=np.uint8)
-        if frame.ndim != 3 or frame.shape[-1] != 3:
-            raise ValueError(
-                'Expected decoded RGB frames with shape (H, W, 3)'
-            )
-        frames.append(frame)
-    return np.stack(frames)
-
-
-def prepare_case(dataset, stats, model, cfg):
-    """Load a clip, starting from its first frame, as in the notebook."""
-    offset = cfg.goal_offset_steps
-    rows = trajectory_rows(dataset, cfg.episode, cfg.start_step, 1, 1, offset)
-    sorted_rows = sorted(rows)
-    inverse = np.argsort(np.argsort(rows))
-    data = dataset.get_row_data(sorted_rows)
-    if cfg.play_in_reverse:
-        inverse = inverse[::-1].copy()
-    if dataset.get_dim('action') != 2:
-        raise ValueError('Overhead pd_ee_delta_xy requires 2D actions')
-    data = {key: np.asarray(value)[inverse] for key, value in data.items()}
-    frame_indices = list(range(0, offset + 1, cfg.action_block))
-    if frame_indices[-1] != offset:
-        frame_indices.append(offset)
-    return case_from_observations(data, stats, model, cfg, frame_indices)
-
-
-def case_from_observations(data, stats, model, cfg, frame_indices):
-    """Apply the same checkpoint input processing to dataset and sim frames."""
+def case_from_observations(start, goal, stats, model, cfg):
+    """Apply training preprocessing to expert start and goal observations."""
     columns = list(getattr(model, 'state_columns', ()) or ['pixels'])
     scalers = {
         col: get_scaler('zscore').fit(stats.get_col_data(col))
         for col in ['action', *[c for c in columns if c != 'pixels']]
     }
     info = {}
-    preview = None
     for col in columns:
-        values = np.asarray(data[col])
+        values = np.stack([start[col], goal[col]])
         if col == 'pixels':
-            values = rgb_frames(values)
-            preview = values[frame_indices].copy()
             images = torch.as_tensor(values).permute(0, 3, 1, 2)
             transform = v2.Compose(
                 [
@@ -148,15 +67,12 @@ def case_from_observations(data, stats, model, cfg, frame_indices):
             goal_key = f'goal_{col}'
         info[col] = values[:1].unsqueeze(0)
         info[goal_key] = values[-1:].unsqueeze(0)
-    poses = np.asarray(data[cfg.pose_column])
-    # Reference notebook poses_to_diff compares the first two clip frames.
-    ground_truth = poses[frame_indices[1], :2] - poses[0, :2]
     info['action_history'] = torch.empty(1, 0, cfg.action_block * 2)
-    return info, scalers['action'], preview, ground_truth
+    return info, scalers['action']
 
 
 def make_goal_environment(cfg):
-    """Create the existing overhead bridge without an expert policy."""
+    """Reuse eval_wm's expert rollout, pair sampling, and prefix replay."""
     from stable_worldmodel.envs.maniskill.pusht import PushTSWMEnv
 
     return PushTSWMEnv(
@@ -165,297 +81,216 @@ def make_goal_environment(cfg):
         camera_name='overhead_camera',
         image_size=cfg.img_size,
         sim_backend=cfg.sim_backend,
-        simulation_max_episode_steps=cfg.horizon * cfg.action_block + 1,
+        expert_checkpoint=cfg.expert_checkpoint,
+        expert_policy_type=cfg.expert_policy_type,
+        expert_encoder=cfg.expert_encoder,
+        expert_max_steps=cfg.expert_max_steps,
+        expert_max_attempts=cfg.expert_max_attempts,
+        expert_min_object_displacement=cfg.expert_min_object_displacement,
+        expert_min_eef_displacement=cfg.expert_min_eef_displacement,
+        goal_step_distance=cfg.goal_offset_steps,
+        goal_eef_position_tolerance=0.02,
+        state_goal=True,
+        simulation_max_episode_steps=cfg.expert_max_steps,
     )
 
 
-def prepare_simulator_case(stats, model, cfg, delta_grid):
-    """Execute one grid candidate and use its true endpoint as the goal."""
-    if cfg.play_in_reverse:
-        raise ValueError('Simulator-generated goals require forward playback')
+def prepare_expert_case(env, stats, model, cfg):
+    """Read the sampled expert endpoints and exact intervening commands."""
     steps = cfg.horizon * cfg.action_block
+    if min(cfg.horizon, cfg.action_block) < 1:
+        raise ValueError('horizon and action_block must be positive')
     if cfg.goal_offset_steps != steps:
-        raise ValueError(
-            'Simulator goals require horizon * action_block steps'
-        )
-    index = cfg.get('goal_action_index')
-    if index is None:
-        index = int(np.random.default_rng(cfg.seed).integers(len(delta_grid)))
-    if not 0 <= index < len(delta_grid):
-        raise ValueError('goal_action_index must index the sampled XY grid')
-    raw = (
-        (delta_grid[index] / (cfg.action_block * cfg.controller_scale))
-        .expand(cfg.horizon, cfg.action_block, 2)
-        .clone()
+        raise ValueError('Expert goals require horizon * action_block steps')
+    start, reset_info = env.reset(
+        seed=cfg.seed,
+        options={'start_from_beginning': cfg.start_from_beginning},
     )
+    if not reset_info.get('expert_task_success', False):
+        raise RuntimeError('Expert did not solve the native task')
+    if env.expert_goal_index != steps:
+        raise ValueError(
+            f'Expert start/goal pair spans {env.expert_goal_index} steps; '
+            f'need {steps}. Use a shorter horizon or a longer expert rollout.'
+        )
+    raw = torch.as_tensor(env.expert_actions[:steps]).float()
+    if raw.shape != (steps, 2) or not torch.isfinite(raw).all():
+        raise ValueError('Expected finite 2D expert actions for the horizon')
     if (raw.abs() > 1 + 1e-6).any():
-        raise ValueError('Selected grid action exceeds controller bounds')
-    env = make_goal_environment(cfg)
-    try:
-        obs, _ = env.reset(seed=cfg.seed)
-        frames = [{**obs, 'pixels': env.render()}]
-        for step, action in enumerate(raw.reshape(-1, 2).numpy()):
-            obs, _, _, truncated, _ = env.step(action)
-            frames.append({**obs, 'pixels': env.render()})
-            if truncated and step + 1 < steps:
-                raise RuntimeError('Simulator ended before the goal horizon')
-        data = {
-            key: np.stack([frame[key] for frame in frames])
-            for key in frames[0]
-        }
-    finally:
-        env.close()
-    frame_indices = list(range(0, steps + 1, cfg.action_block))
-    info, scaler, preview, pose_delta = case_from_observations(
-        data, stats, model, cfg, frame_indices
+        raise ValueError('Expert actions exceed controller bounds')
+    raw = raw.reshape(cfg.horizon, cfg.action_block, 2)
+    goal = {**env.goal_observation, 'pixels': env.expert_frames[steps]}
+    start = {**start, 'pixels': env.expert_frames[0]}
+    info, scaler = case_from_observations(start, goal, stats, model, cfg)
+    preview = env.expert_frames[: steps + 1 : cfg.action_block].copy()
+    pose_delta = (
+        np.asarray(goal[cfg.pose_column])[:2]
+        - np.asarray(start[cfg.pose_column])[:2]
     )
-    # Save start/goal RGB even for state checkpoints.
-    if preview is None:
-        preview = data['pixels'][frame_indices].copy()
-    actions = scaler.transform(raw).flatten(1)
-    return info, scaler, preview, pose_delta, actions, raw, index
+    metadata = {
+        key: value
+        for key, value in reset_info.items()
+        if key.startswith('expert_') or key == 'goal_step_distance'
+    }
+    return info, scaler, preview, pose_delta, raw, metadata
 
 
-def recorded_action_sequence(dataset, scaler, cfg):
-    """Read the executed actions for the same horizon as the action grid.
+def build_action_grid(cfg, scaler, expert_raw):
+    """Sweep XY offsets around zero or the exact expert controller sequence.
 
-    Reverse playback has no recorded inverse controls; negating the commands
-    would invent an unexecuted trajectory, so no recorded score is provided.
+    Each offset is applied evenly across a block. Clipping uses the controller
+    bounds; axes are calculated from the commands actually evaluated.
     """
-    if cfg.play_in_reverse:
-        return None, None
-    steps = cfg.horizon * cfg.action_block
-    rows = trajectory_rows(dataset, cfg.episode, cfg.start_step, 1, 1, steps)
-    sorted_rows = sorted(rows)
-    inverse = np.argsort(np.argsort(rows))
-    values = np.asarray(dataset.get_row_data(sorted_rows)['action'])[inverse][
-        :-1
-    ]
-    if not np.isfinite(values).all():
-        raise ValueError(
-            'Recorded ground-truth sequence contains invalid actions'
-        )
-    raw = (
-        torch.as_tensor(values)
-        .float()
-        .reshape(cfg.horizon, cfg.action_block, 2)
+    if not np.isfinite(cfg.controller_scale) or cfg.controller_scale <= 0:
+        raise ValueError('controller_scale must be positive and finite')
+    _, offsets = xy_action_grid(cfg.samples, -cfg.grid_size, cfg.grid_size)
+    mean = (
+        expert_raw
+        if cfg.use_expert_action_mean
+        else torch.zeros_like(expert_raw)
     )
-    normalized = scaler.transform(raw).flatten(1)
-    return normalized, raw
-
-
-@torch.inference_mode()
-def plan_with_cem(model, info, scaler, cfg, objective):
-    """Use the shared planning solver on full trained action chunks."""
-    plan = PlanConfig(**OmegaConf.to_container(cfg.plan_config, resolve=True))
-    if plan.action_block != cfg.action_block:
-        raise ValueError('plan_config.action_block must match action_block')
-    cost = ShootingCostEvaluator(model, objective)
-    solver = hydra.utils.instantiate(cfg.solver, cost=cost)
-    # CEM expects the batched World action-space shape (environments, XY).
-    solver.configure(
-        action_space=Box(-1.0, 1.0, shape=(1, 2)), n_envs=1, config=plan
+    commands = mean[None] + offsets[:, None, None] / (
+        cfg.action_block * cfg.controller_scale
     )
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
-    inputs = {k: v.to(device=device, dtype=dtype) for k, v in info.items()}
-    actions = solver.solve(inputs)['actions'][0]
-    raw = scaler.inverse_transform(
-        actions.reshape(plan.horizon, plan.action_block, 2)
-    )
-    delta = raw.sum(1) * cfg.controller_scale
-    energy = evaluate_action_sequences(
-        model, info, actions.unsqueeze(0), objective, cfg.chunk_size
-    )[0].item()
-    return actions, raw, delta, energy
+    raw = commands.clamp(-1, 1)
+    clipped = int((raw != commands).flatten(1).any(1).sum())
+    candidates = scaler.transform(raw).flatten(2)
+    total = raw.sum((1, 2)) * cfg.controller_scale
+    coordinates = total.reshape(cfg.samples, cfg.samples, 2)
+    axes = torch.stack([coordinates[0, :, 0], coordinates[:, 0, 1]])
+    return axes, raw, candidates, clipped
 
 
 def evaluate(cfg):
-    """Run one landscape and save 2D/3D plots, raw arrays, and metadata."""
+    """Load model and normalization stats, then evaluate one expert pair."""
     model = load_pretrained(cfg.policy, cache_dir=cfg.cache_dir)
     model = model.to(cfg.device).eval().requires_grad_(False)
     columns = list(getattr(model, 'state_columns', ()) or ['pixels'])
-    dataset = swm.data.load_dataset(
+    keys = ['action', *[col for col in columns if col != 'pixels']]
+    stats = swm.data.load_dataset(
         cfg.dataset_name,
         cache_dir=cfg.cache_dir,
-        keys_to_load=list(
-            dict.fromkeys(['action', *columns, cfg.pose_column])
-        ),
-        keys_to_cache=['action'],
+        keys_to_load=keys,
+        keys_to_cache=keys,
     )
-    stats = (
-        dataset
-        if cfg.stats_dataset is None
-        else swm.data.load_dataset(
-            cfg.stats_dataset,
-            cache_dir=cfg.cache_dir,
-            keys_to_load=['action', *[c for c in columns if c != 'pixels']],
-        )
-    )
-    source = cfg.get('goal_source', 'simulator')
-    axis, delta_grid = xy_action_grid(
-        cfg.samples, -cfg.grid_size, cfg.grid_size
-    )
-    center = torch.zeros(2)
-    goal_index = None
-    if source == 'dataset':
-        info, scaler, preview, ground_truth = prepare_case(
-            dataset, stats, model, cfg
-        )
-        recorded_actions, recorded_raw = recorded_action_sequence(
-            dataset, scaler, cfg
-        )
-        if recorded_raw is not None:
-            center = (
-                recorded_raw.sum((0, 1)) * cfg.controller_scale / cfg.horizon
-            )
-        delta_grid = delta_grid + center
-    elif source == 'simulator':
-        (
-            info,
-            scaler,
-            preview,
-            ground_truth,
-            recorded_actions,
-            recorded_raw,
-            goal_index,
-        ) = prepare_simulator_case(stats, model, cfg, delta_grid)
-    else:
-        raise ValueError(f'Unknown goal_source: {source!r}')
-    model = NotebookDynamics(model, normalize=cfg.normalize_reps).eval()
-    plot_axes = (axis[None, :] + center[:, None]) * cfg.horizon
-    delta_sequences = delta_grid[:, None].expand(-1, cfg.horizon, -1)
-    candidates = pack_delta_sequences(
-        delta_sequences, scaler, cfg.action_block, cfg.controller_scale
-    )
-    # Representations are already normalized at encode and every prediction.
-    objective = EndpointEnergy('l1', normalize=False)
+    with closing(make_goal_environment(cfg)) as env:
+        return evaluate_case(model, stats, env, cfg)
 
+
+def evaluate_case(model, stats, env, cfg):
+    """Score the grid and expert reference from the restored start."""
+    info, scaler, preview, pose_delta, expert_raw, expert_metadata = (
+        prepare_expert_case(env, stats, model, cfg)
+    )
+    axes, raw_candidates, candidates, clipped = build_action_grid(
+        cfg, scaler, expert_raw
+    )
+    model = NotebookDynamics(model, normalize=cfg.normalize_reps).eval()
+    objective = EndpointEnergy('l1', normalize=False)
     energy = evaluate_action_sequences(
         model, info, candidates, objective, cfg.chunk_size
     )
-    recorded_energy = None
-    recorded_delta = None
-    if recorded_actions is not None:
-        recorded_energy = evaluate_action_sequences(
-            model,
-            info,
-            recorded_actions.unsqueeze(0),
-            objective,
-            cfg.chunk_size,
-        )[0].item()
-        recorded_delta = (
-            recorded_raw.sum((0, 1)) * cfg.controller_scale
-        ).numpy()
-    cem_actions, cem_raw, cem_delta, cem_energy = plan_with_cem(
-        model, info, scaler, cfg, objective
+    expert_actions = scaler.transform(expert_raw).flatten(1)
+    expert_energy = evaluate_action_sequences(
+        model, info, expert_actions.unsqueeze(0), objective, cfg.chunk_size
+    )[0].item()
+    total_delta = (raw_candidates.sum((1, 2)) * cfg.controller_scale).numpy()
+    expert_delta = (expert_raw.sum((0, 1)) * cfg.controller_scale).numpy()
+    mean_raw = (
+        expert_raw
+        if cfg.use_expert_action_mean
+        else torch.zeros_like(expert_raw)
     )
-    total_delta = delta_sequences.sum(1).numpy()
-    # Match the notebook's weighted histogram, with XY replacing XZ.
+    best_idx = int(energy.argmin())
+    best_raw = raw_candidates[best_idx].numpy()
+    best_deltas = best_raw.sum(1) * cfg.controller_scale
+    best_energy = energy[best_idx].item()
     histogram, xedges, yedges = np.histogram2d(
         total_delta[:, 0],
         total_delta[:, 1],
         weights=energy.numpy(),
         bins=cfg.samples,
     )
-    best_idx = int(energy.argmin())
-    best_action = delta_grid[best_idx].numpy()
+    heatmap = energy.reshape(cfg.samples, cfg.samples).numpy()
     output = Path(cfg.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    heatmap = energy.reshape(cfg.samples, cfg.samples).numpy()
-    if preview is not None and len(preview):
-        Image.fromarray(preview[0]).save(output / 'start.png')
-        Image.fromarray(preview[-1]).save(output / 'goal.png')
+    comparison = env.planning_action_comparison(
+        {
+            'Grid minimum': best_raw.reshape(-1, 2),
+            'Expert actions': expert_raw.numpy().reshape(-1, 2),
+        },
+        output / 'best_action',
+    )
+    Image.fromarray(preview[0]).save(output / 'start.png')
+    Image.fromarray(preview[-1]).save(output / 'goal.png')
+    start_step = expert_metadata['expert_start_step']
     metadata = {
         'config': OmegaConf.to_container(cfg, resolve=True),
-        'goal_source': source,
-        'goal_action_index': goal_index,
-        'reference_action_label': 'Executed grid action'
-        if source == 'simulator'
-        else 'Recorded GT',
-        'grid_center_total_delta': (center * cfg.horizon).tolist(),
-        'grid_center_source': 'zero_simulator_grid'
-        if source == 'simulator'
-        else (
-            'recorded_action'
-            if recorded_raw is not None
-            else 'zero_no_recorded_reverse_action'
-        ),
-        'best_grid_action': best_action.tolist(),
-        'best_grid_energy': energy[best_idx].item(),
+        'goal_source': 'expert',
+        'expert': expert_metadata,
+        'comparison_video': 'best_action/env_0.mp4',
+        'comparison_results': comparison,
+        'reference_action_label': 'Expert actions',
+        'grid_center_total_delta': (
+            mean_raw.sum((0, 1)) * cfg.controller_scale
+        ).tolist(),
+        'grid_center_source': 'expert_sequence'
+        if cfg.use_expert_action_mean
+        else 'zero',
+        'grid_clipped_candidates': clipped,
+        'best_grid_action': best_deltas[0].tolist(),
+        'best_grid_delta_sequence': best_deltas.tolist(),
+        'best_grid_energy': best_energy,
         'best_grid_total_delta': total_delta[best_idx].tolist(),
-        'ground_truth_delta': ground_truth.tolist(),
-        'ground_truth_action_total_delta': recorded_delta.tolist()
-        if recorded_delta is not None
-        else None,
-        'ground_truth_action_energy': recorded_energy,
-        'ground_truth_action_minus_grid_min': recorded_energy
-        - energy[best_idx].item()
-        if recorded_energy is not None
-        else None,
+        'ground_truth_delta': pose_delta.tolist(),
+        'ground_truth_action_total_delta': expert_delta.tolist(),
+        'ground_truth_action_energy': expert_energy,
+        'ground_truth_action_minus_grid_min': expert_energy - best_energy,
         'grid_actions_with_lower_energy': int(
-            (energy < recorded_energy - 1e-6).sum()
-        )
-        if recorded_energy is not None
-        else None,
-        'cem_delta_sequence': cem_delta.tolist(),
-        'cem_first_delta': cem_delta[0].tolist(),
-        'cem_first_controller_action': cem_raw[0, 0].tolist(),
-        'cem_energy': cem_energy,
-        'context_step': (0 if source == 'simulator' else cfg.start_step)
-        + (cfg.goal_offset_steps if cfg.play_in_reverse else 0),
-        'goal_step': (0 if source == 'simulator' else cfg.start_step)
-        + (0 if cfg.play_in_reverse else cfg.goal_offset_steps),
-        'action_units': 'XY delta in meters per model prediction; plot axes sum applied deltas',
+            (energy < expert_energy - 1e-6).sum()
+        ),
+        'context_step': start_step,
+        'goal_step': start_step + cfg.goal_offset_steps,
+        'action_units': (
+            'XY delta in meters per model prediction; '
+            'plot axes sum applied controller deltas'
+        ),
     }
     np.savez_compressed(
         output / 'landscape.npz',
-        goal_source=np.array(source),
-        goal_action_index=np.array(
-            goal_index if goal_index is not None else -1
-        ),
-        reference_action_label=np.array(metadata['reference_action_label']),
-        axis=plot_axes.numpy(),
+        goal_source=np.array('expert'),
+        reference_action_label=np.array('Expert actions'),
+        axis=axes.numpy(),
         histogram=histogram.T,
         xedges=xedges,
         yedges=yedges,
         total_deltas=total_delta,
-        ground_truth_delta=ground_truth,
-        ground_truth_model_action_sequence=recorded_actions.numpy()
-        if recorded_actions is not None
-        else np.empty((0,)),
-        ground_truth_controller_action_sequence=recorded_raw.numpy()
-        if recorded_raw is not None
-        else np.empty((0,)),
-        ground_truth_action_total_delta=recorded_delta
-        if recorded_delta is not None
-        else np.empty((0,)),
-        ground_truth_action_energy=recorded_energy
-        if recorded_energy is not None
-        else np.nan,
-        cem_delta_sequence=cem_delta.numpy(),
-        cem_model_action_sequence=cem_actions.numpy(),
-        cem_controller_action_sequence=cem_raw.numpy(),
+        ground_truth_delta=pose_delta,
+        ground_truth_model_action_sequence=expert_actions.numpy(),
+        ground_truth_controller_action_sequence=expert_raw.numpy(),
+        ground_truth_action_total_delta=expert_delta,
+        ground_truth_action_energy=expert_energy,
+        grid_center_controller_action_sequence=mean_raw.numpy(),
         energy=heatmap,
-        raw_actions=(
-            delta_grid / (cfg.action_block * cfg.controller_scale)
-        ).numpy(),
+        raw_actions=raw_candidates[:, 0, 0].numpy(),
+        controller_action_sequences=raw_candidates.numpy(),
         model_action_sequences=candidates.numpy(),
-        clip_frames=preview if preview is not None else np.empty((0,)),
+        clip_frames=preview,
     )
-    (output / 'results.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    metadata_json = json.dumps(metadata, indent=2)
+    (output / 'results.json').write_text(metadata_json + '\n')
     plot_landscape(
-        plot_axes.numpy(),
+        axes.numpy(),
         heatmap,
         histogram.T,
         xedges,
         yedges,
-        ground_truth,
+        pose_delta,
         metadata,
         output,
         preview,
     )
-    print(json.dumps(metadata, indent=2))
+    print(metadata_json)
     print(f'Saved energy landscape to {output.resolve()}')
     return metadata
 
@@ -512,18 +347,31 @@ def plot_landscape(
         reference_action = np.asarray(reference_action)
         points.append(reference_action)
         if np.any((reference_action < lower) | (reference_action > upper)):
-            notes.append('recorded action outside sweep')
+            notes.append('reference action outside sweep')
     bounds = np.stack(points)
     padding = (upper - lower) * 0.04
     limits = (bounds.min(0) - padding, bounds.max(0) + padding)
     note = ' · '.join(notes)
     if recorded:
         gap = reference_energy - float(energy[index])
-        note += f'\n{reference_label} energy {reference_energy:.4g} · grid minimum {energy[index]:.4g} · difference {gap:+.4g}'
+        note += (
+            f'\n{reference_label} energy {reference_energy:.4g} · '
+            f'grid minimum {energy[index]:.4g} · difference {gap:+.4g}'
+        )
     cfg = metadata.get('config', {})
-    title = f'Episode {cfg.get("episode", "?")} · step {metadata.get("context_step", cfg.get("start_step", "?"))}'
-    if metadata.get('goal_source') == 'simulator':
-        title = f'Simulator seed {cfg.get("seed", "?")} · grid action {metadata.get("goal_action_index", "?")}'
+    context_step = metadata.get('context_step', cfg.get('start_step', '?'))
+    title = f'Episode {cfg.get("episode", "?")} · step {context_step}'
+    if metadata.get('goal_source') == 'expert':
+        expert = metadata.get('expert', {})
+        title = (
+            f'Expert seed {expert.get("expert_seed", cfg.get("seed", "?"))}'
+            f' · steps {context_step}–{metadata.get("goal_step", "?")}'
+        )
+    elif metadata.get('goal_source') == 'simulator':
+        title = (
+            f'Simulator seed {cfg.get("seed", "?")} · '
+            f'grid action {metadata.get("goal_action_index", "?")}'
+        )
     with plt.rc_context(
         {
             'font.size': 10,
